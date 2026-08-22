@@ -53,24 +53,38 @@ Läuft als Docker-Container. **Muss unter `~/services/` liegen**, nicht unter
 `/opt`: der Docker-Daemon auf dem Server ist die Snap-Variante und lehnt
 Bind-Mounts unterhalb von `/opt` ab (`read-only file system`).
 
+Das erledigt ein Skript. Einmal von Hand holen, danach macht es den Rest:
+
 ```bash
 ssh HeimServerLocal          # oder HeimServerRemote von außerhalb
-git clone git@github.com:Flexii2000/whatsapp-transcription.git \
-    ~/services/whatsapp-transcribe-repo
-ln -s ~/services/whatsapp-transcribe-repo/server ~/services/whatsapp-transcribe
 
-cd ~/services/whatsapp-transcribe
-cp .env.example .env
-openssl rand -hex 32          # → als AUTH_TOKEN in die .env
-$EDITOR .env                  # AUTH_TOKEN + ANTHROPIC_API_KEY eintragen
-
-cp deploy/update-whatsapp-transcribe.sh ~/scripts/
-~/scripts/update-whatsapp-transcribe.sh
+# Erstinstallation
+~/scripts/setup-whatsapp-transcribe.sh
 ```
 
-Der erste Start lädt das Whisper-Modell herunter (`large-v3-turbo`, ~1,6 GB)
-— das dauert einige Minuten. Das Skript wartet darauf und zeigt am Ende die
-`/health`-Antwort.
+Das Skript prüft Docker, Port und Plattenplatz, klont das Repo nach
+`~/services/whatsapp-transcribe`, erzeugt eine `.env` mit frischem
+`AUTH_TOKEN`, fragt nach dem Anthropic-Key (Eingabe bleibt unsichtbar,
+leer lassen ist erlaubt), baut den Container, wartet auf `/health` und
+druckt am Ende Adresse und Token für die Extension aus.
+
+Vorher nur schauen, ohne etwas zu verändern:
+
+```bash
+~/scripts/setup-whatsapp-transcribe.sh --check
+```
+
+Der erste Durchlauf dauert einige Minuten — Image bauen plus Whisper-Modell
+herunterladen (`large-v3-turbo`, ~1,6 GB).
+
+Gefahrlos wiederholbar: eine vorhandene `.env` wird nie überschrieben, ein
+vorhandenes Repo nur nachgezogen.
+
+**Später aktualisieren:**
+
+```bash
+~/scripts/update-whatsapp-transcribe.sh     # git pull + rebuild + Healthcheck
+```
 
 ### nginx — als Pfad unter `fherrmann.com`
 
@@ -120,7 +134,7 @@ In die Tabelle *fherrmann.com — eigene Projekte* gehoert dann:
 
 | Domain | Was | Server-Pfad | Repo |
 |---|---|---|---|
-| `fherrmann.com/whisper` | Sprachmemo-Transkription (faster-whisper + Claude), Proxy auf `:8099` | `~/services/whatsapp-transcribe` (**nicht** `/opt` — Snap-Docker!) | `git@github.com:Flexii2000/whatsapp-transcription.git` — lokal: `~/Server-Projects/whatsapp-transcription`. Update: `~/scripts/update-whatsapp-transcribe.sh`. nginx: `snippets/whisper.conf` + `conf.d/whisper-limits.conf` |
+| `fherrmann.com/whisper` | Sprachmemo-Transkription (faster-whisper + Claude), Proxy auf `:8099` | `~/services/whatsapp-transcribe` (Repo-Wurzel; Compose liegt in `server/`, **nicht** `/opt` — Snap-Docker!) | `git@github.com:Flexii2000/whatsapp-transcription.git` — lokal: `~/Server-Projects/whatsapp-transcription`. Setup: `~/scripts/setup-whatsapp-transcribe.sh`, Update: `~/scripts/update-whatsapp-transcribe.sh`. nginx: `snippets/whisper.conf` + `conf.d/whisper-limits.conf` |
 
 ---
 
@@ -330,7 +344,8 @@ server/
   deploy/
     nginx-whisper-location.conf      location-Block → snippets/whisper.conf
     nginx-whisper-limits.conf        Rate-Limit-Zonen → conf.d/
-    update-whatsapp-transcribe.sh    Deploy nach ~/scripts/
+    setup-whatsapp-transcribe.sh     Erstinstallation (--check für Trockenlauf)
+    update-whatsapp-transcribe.sh    git pull + rebuild + Healthcheck
 
 extension/
   manifest.json                      MV3
