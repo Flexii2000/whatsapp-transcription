@@ -4,7 +4,6 @@ const DEFAULTS = {
   backendUrl: "",
   authToken: "",
   autoTranscribe: true,
-  autoForcePlay: false,
   expandFullByDefault: false,
   maxParallel: 2,
   debug: false,

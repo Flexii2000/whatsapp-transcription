@@ -194,7 +194,7 @@ body.dark .wat {
 }
 
 .wat[data-wat-state="error"] .wat__label,
-.wat[data-wat-state="needs-play"] .wat__label {
+.wat[data-wat-state="idle"] .wat__label {
   text-transform: none;
   letter-spacing: 0;
   font-size: 12px;

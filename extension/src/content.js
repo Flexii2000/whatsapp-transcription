@@ -1,28 +1,26 @@
 /**
  * WhatsApp Sprachmemo-Transkription — Content-Script (Isolated World).
  *
- * Findet empfangene Sprachnachrichten im DOM, holt die entschluesselten
- * Audiobytes aus der blob:-URL des <audio>-Elements, schickt sie an den
- * Service-Worker (der spricht mit dem Backend) und haengt das Ergebnis als
- * Untertext in die Nachrichtenblase.
+ * Findet empfangene Sprachnachrichten, holt die entschluesselten Audiodaten
+ * ueber page-bridge.js aus WhatsApps eigenem Modulsystem und haengt das
+ * Ergebnis als Untertext in die Nachrichtenblase.
  *
- * WhatsApp Web hat keine stabilen CSS-Klassen. Alles, was sich an der
- * Oberflaeche aendern kann, steht deshalb gebuendelt in SELECTORS —
- * das ist die einzige Stelle, die bei einem WhatsApp-Redesign angefasst
- * werden muss.
+ * Warum nicht ueber <audio>: das gibt es in WhatsApp Web nicht mehr. Die
+ * Wellenform ist ein <canvas>, abgespielt wird ueber die Web-Audio-API, und
+ * im DOM steht keine blob:-URL. Deshalb liefert das DOM hier nur noch die
+ * Positionen der Blasen; alles Inhaltliche kommt aus dem Modell.
+ *
+ * Was sich am DOM aendern kann, steht gebuendelt in SELECTORS.
  */
 (() => {
   "use strict";
 
   const SELECTORS = {
-    // Anker ist immer das <audio>-Element — das ueberlebt jedes Redesign.
-    audio: "audio",
-    // Nachrichtenblase, eingehend / ausgehend
-    bubbleIn: ".message-in",
-    bubbleOut: ".message-out",
-    // Traegt die WhatsApp-Message-ID, Format: <fromMe>_<chatId>_<msgId>
-    idHolder: "[data-id]",
-    // Play/Pause-Knopf innerhalb der Blase (nur fuer den manuellen Nudge)
+    // Die Nachricht traegt ihre ID — im DOM die blanke Message-ID.
+    message: "[data-id]",
+    // Sicherster Marker fuer eine Sprachnachricht (ptt = push to talk).
+    voiceIcon: '[data-icon="ptt-status"]',
+    // Nur fuer den Einhaengepunkt, nicht zum Ausloesen.
     playButton: 'button[aria-label], div[role="button"][aria-label]',
   };
 
@@ -30,10 +28,8 @@
     backendUrl: "",
     authToken: "",
     autoTranscribe: true,
-    autoForcePlay: false,      // sendet Gelesen-Bestaetigung — bewusst aus
     expandFullByDefault: false,
     maxParallel: 2,
-    srcWaitMs: 6000,
     debug: false,
   };
 
@@ -43,207 +39,86 @@
   const registry = new Map();
   const queue = [];
   let active = 0;
-  let bridgeSeq = 0;
-  const bridgePending = new Map();
 
   const log = (...a) => cfg.debug && console.log("[WA-Transkript]", ...a);
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-  // ---------------------------------------------------------------- Utils
+  // ------------------------------------------------------- Seitenbruecke
 
-  function arrayBufferToBase64(buf) {
-    const bytes = new Uint8Array(buf);
-    const CHUNK = 0x8000;
-    let binary = "";
-    for (let i = 0; i < bytes.length; i += CHUNK) {
-      binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
-    }
-    return btoa(binary);
-  }
-
-  function messageKeyOf(audioEl) {
-    const holder = audioEl.closest(SELECTORS.idHolder);
-    const id = holder && holder.getAttribute("data-id");
-    if (id) return id;
-    // Ohne data-id gibt es keinen ueber Reloads stabilen Schluessel —
-    // dann eben nur fuer diese Sitzung.
-    if (!audioEl.dataset.watFallbackKey) {
-      audioEl.dataset.watFallbackKey = "session-" + Math.random().toString(36).slice(2);
-    }
-    return audioEl.dataset.watFallbackKey;
-  }
-
-  /** true = empfangen, false = selbst gesendet, null = unklar */
-  function isIncoming(audioEl) {
-    if (audioEl.closest(SELECTORS.bubbleIn)) return true;
-    if (audioEl.closest(SELECTORS.bubbleOut)) return false;
-    const holder = audioEl.closest(SELECTORS.idHolder);
-    const id = (holder && holder.getAttribute("data-id")) || "";
-    if (id.startsWith("false_")) return true;
-    if (id.startsWith("true_")) return false;
-    return null;
-  }
-
-  function findBubble(audioEl) {
-    return (
-      audioEl.closest(SELECTORS.bubbleIn) ||
-      audioEl.closest(SELECTORS.bubbleOut) ||
-      audioEl.closest(SELECTORS.idHolder)
-    );
-  }
-
-  /** Container innerhalb der Blase, in den das Panel gehaengt wird. */
-  function findMountParent(bubble) {
-    const inner = bubble.querySelector(":scope > div");
-    return inner || bubble;
-  }
+  let reqSeq = 0;
+  const pending = new Map();
 
   /**
-   * Die Zeile mit Uhrzeit und Haken. Das Panel gehoert davor, damit die
-   * Uhrzeit wie gewohnt unten rechts in der Blase stehen bleibt und nicht
-   * mitten in der Nachricht landet.
-   *
-   * WhatsApp hat dafuer keine stabile Klasse, deshalb ueber den Inhalt:
-   * die Meta-Zeile ist kurz und besteht im Kern aus einer Uhrzeit.
+   * Fragt page-bridge.js im Seitenkontext. Nur dort ist window.require und
+   * damit WhatsApps Nachrichtenspeicher erreichbar.
    */
-  function findMetaRow(parent) {
-    const kids = Array.from(parent.children);
-    for (let i = kids.length - 1; i >= 0; i--) {
-      const kid = kids[i];
-      if (kid.dataset && kid.dataset.watPanel) continue;
-      const text = (kid.textContent || "").trim();
-      if (text.length <= 14 && /^\d{1,2}[:.]\d{2}(\s?[APap][Mm])?$/.test(text)) return kid;
-    }
-    return null;
-  }
-
-  function usableSrc(audioEl) {
-    const s = audioEl.currentSrc || audioEl.getAttribute("src") || "";
-    return /^(blob:|data:|https?:)/.test(s) ? s : "";
-  }
-
-  // ------------------------------------------------- Audiobytes besorgen
-
-  function waitForSrc(audioEl, timeoutMs) {
-    const now = usableSrc(audioEl);
-    if (now) return Promise.resolve(now);
-
-    return new Promise((resolve) => {
-      let done = false;
-      const finish = (val) => {
-        if (done) return;
-        done = true;
-        obs.disconnect();
-        clearInterval(poll);
-        clearTimeout(timer);
-        resolve(val);
-      };
-      const check = () => {
-        const s = usableSrc(audioEl);
-        if (s) finish(s);
-      };
-      const obs = new MutationObserver(check);
-      obs.observe(audioEl, { attributes: true, attributeFilter: ["src"] });
-      // WhatsApp setzt src teils ueber die Property statt ueber das Attribut,
-      // was der MutationObserver nicht sieht — deshalb zusaetzlich pollen.
-      const poll = setInterval(check, 250);
-      const timer = setTimeout(() => finish(""), timeoutMs);
-    });
-  }
-
-  function bridgeFetch(url) {
+  function bridge(op, payload = {}, timeoutMs = 60000) {
     return new Promise((resolve, reject) => {
-      const id = "b" + ++bridgeSeq;
+      const rid = "r" + ++reqSeq;
       const timer = setTimeout(() => {
-        bridgePending.delete(id);
-        reject(new Error("Page-Bridge hat nicht geantwortet"));
-      }, 20000);
+        pending.delete(rid);
+        reject(new Error("Seitenbrücke antwortet nicht"));
+      }, timeoutMs);
 
-      bridgePending.set(id, (msg) => {
+      pending.set(rid, (msg) => {
         clearTimeout(timer);
-        if (msg.ok) resolve({ b64: msg.b64, mime: msg.mime, size: msg.size });
-        else reject(new Error(msg.error || "Bridge-Fehler"));
+        if (msg.ok) resolve(msg);
+        else reject(new Error(msg.error || "Brückenfehler"));
       });
 
       window.dispatchEvent(
-        new CustomEvent("wat:blob-request", { detail: JSON.stringify({ id, url }) })
+        new CustomEvent("wat:request", { detail: JSON.stringify({ rid, op, ...payload }) })
       );
     });
   }
 
-  window.addEventListener("wat:blob-response", (event) => {
+  window.addEventListener("wat:response", (event) => {
     let msg;
     try {
       msg = JSON.parse(event.detail);
     } catch {
       return;
     }
-    const cb = bridgePending.get(msg.id);
+    const cb = pending.get(msg.rid);
     if (!cb) return;
-    bridgePending.delete(msg.id);
+    pending.delete(msg.rid);
     cb(msg);
   });
 
-  async function readAudio(audioEl) {
-    let src = await waitForSrc(audioEl, cfg.srcWaitMs);
-
-    if (!src && cfg.autoForcePlay) {
-      log("kein src — erzwinge Laden ueber Play/Pause");
-      await nudgePlay(audioEl);
-      src = await waitForSrc(audioEl, cfg.srcWaitMs);
-    }
-    if (!src) {
-      const err = new Error("Audio noch nicht geladen");
-      err.code = "needs-play";
-      throw err;
-    }
-
-    // Erst der direkte Weg, dann die Bruecke im Seitenkontext.
-    try {
-      const res = await fetch(src);
-      if (res.ok) {
-        const buf = await res.arrayBuffer();
-        if (buf.byteLength > 0) {
-          const mime = (res.headers.get("content-type") || "audio/ogg").split(";")[0].trim();
-          return { b64: arrayBufferToBase64(buf), mime, size: buf.byteLength };
-        }
-      }
-    } catch (e) {
-      log("direkter Blob-Fetch fehlgeschlagen, nutze Bridge:", e.message);
-    }
-    return await bridgeFetch(src);
-  }
+  // ---------------------------------------------------------------- DOM
 
   /**
-   * Stoesst WhatsApps eigenen Media-Download an, indem kurz abgespielt wird.
-   * ACHTUNG: markiert die Sprachnachricht fuer den Absender als abgehoert.
-   * Wird nur nach ausdruecklicher Freigabe aufgerufen.
+   * Der Container, der Player und Zeitstempel gemeinsam haelt. Dort hinein
+   * kommt das Panel, und zwar vor die Zeitstempel-Zeile, damit die Uhrzeit
+   * wie gewohnt unten rechts stehen bleibt.
+   *
+   * Alle Klassennamen in WhatsApp Web sind obfuskiert und wechseln staendig,
+   * deshalb ueber die Struktur statt ueber Selektoren.
    */
-  async function nudgePlay(audioEl) {
-    const prev = { muted: audioEl.muted, volume: audioEl.volume, time: audioEl.currentTime };
-    audioEl.muted = true;
-    audioEl.volume = 0;
+  function findMount(bubble) {
+    const btn = bubble.querySelector(SELECTORS.playButton);
+    // Achtung: in der Blase stehen ZWEI Zeitangaben im Format m:ss — die
+    // Laenge des Memos im Player ("0:38") und die Uhrzeit der Nachricht
+    // ("14:32"). Gebraucht wird die zweite, und die kommt in der
+    // Dokumentreihenfolge zuletzt.
+    const zeiten = Array.from(bubble.querySelectorAll("span,div")).filter(
+      (e) =>
+        e.children.length === 0 &&
+        /^\d{1,2}[:.]\d{2}(\s?[APap][Mm])?$/.test((e.textContent || "").trim())
+    );
+    const zeit = zeiten[zeiten.length - 1];
 
-    const bubble = findBubble(audioEl);
-    const btn =
-      bubble &&
-      Array.from(bubble.querySelectorAll(SELECTORS.playButton)).find((b) =>
-        /play|abspielen|wiedergabe/i.test(b.getAttribute("aria-label") || "")
-      );
-
-    try {
-      if (btn) btn.click();
-      else await audioEl.play().catch(() => {});
-      await sleep(400);
-    } finally {
-      try {
-        if (btn) btn.click();
-        else audioEl.pause();
-        audioEl.currentTime = prev.time;
-      } catch {}
-      audioEl.muted = prev.muted;
-      audioEl.volume = prev.volume;
+    if (btn && zeit) {
+      let parent = zeit.parentElement;
+      while (parent && parent !== bubble && !parent.contains(btn)) {
+        parent = parent.parentElement;
+      }
+      if (parent) {
+        let meta = zeit;
+        while (meta && meta.parentElement !== parent) meta = meta.parentElement;
+        return { parent, meta };
+      }
     }
+    return { parent: bubble.firstElementChild || bubble, meta: null };
   }
 
   // ----------------------------------------------------------- UI / Panel
@@ -252,8 +127,6 @@
     const root = document.createElement("div");
     root.className = "wat";
     root.dataset.watPanel = entry.key;
-    // Klicks im Panel duerfen nicht die WhatsApp-Nachricht selektieren
-    // oder das Kontextmenue der Blase ausloesen.
     ["click", "dblclick", "mousedown", "pointerdown"].forEach((t) =>
       root.addEventListener(t, (e) => e.stopPropagation())
     );
@@ -263,18 +136,17 @@
 
     const label = document.createElement("span");
     label.className = "wat__label";
-    head.appendChild(label);
 
     const spacer = document.createElement("span");
     spacer.className = "wat__spacer";
-    head.appendChild(spacer);
 
     // Kein Handler hier: welche Aktion der Knopf ausloest, haengt vom
-    // Zustand ab und wird deshalb ausschliesslich in render() gesetzt.
+    // Zustand ab und wird ausschliesslich in render() gesetzt.
     const toggle = document.createElement("button");
     toggle.type = "button";
     toggle.className = "wat__toggle";
-    head.appendChild(toggle);
+
+    head.append(label, spacer, toggle);
 
     const bullets = document.createElement("ul");
     bullets.className = "wat__bullets";
@@ -305,19 +177,6 @@
     }
     root.classList.remove("wat--busy");
 
-    if (entry.state === "needs-play") {
-      label.textContent = "Sprachnachricht noch nicht geladen";
-      toggle.hidden = false;
-      toggle.textContent = "Laden & transkribieren";
-      toggle.classList.add("wat__toggle--action");
-      toggle.onclick = () => {
-        entry.forcePlayOnce = true;
-        entry.state = "idle";
-        enqueue(entry.key, true);
-      };
-      return;
-    }
-
     if (entry.state === "error") {
       label.textContent = entry.error || "Fehler";
       toggle.hidden = false;
@@ -327,6 +186,15 @@
         entry.state = "idle";
         enqueue(entry.key, true);
       };
+      return;
+    }
+
+    if (entry.state === "idle" && !cfg.autoTranscribe) {
+      label.textContent = "Sprachnachricht";
+      toggle.hidden = false;
+      toggle.textContent = "Transkribieren";
+      toggle.classList.add("wat__toggle--action");
+      toggle.onclick = () => enqueue(entry.key, true);
       return;
     }
 
@@ -370,33 +238,14 @@
   }
 
   function mount(entry) {
-    const parent = findMountParent(entry.bubble);
+    if (!entry.bubble || !entry.bubble.isConnected) return;
+    const { parent, meta } = findMount(entry.bubble);
     if (!parent) return;
     if (!entry.nodes) buildPanel(entry);
     if (entry.nodes.root.parentNode !== parent) {
-      const meta = findMetaRow(parent);
-      if (meta) parent.insertBefore(entry.nodes.root, meta);
+      if (meta && meta.parentElement === parent) parent.insertBefore(entry.nodes.root, meta);
       else parent.appendChild(entry.nodes.root);
       render(entry);
-    }
-  }
-
-  /**
-   * Einmal pro Sekunde: Panels zurueckholen, die React beim Neuaufbau der
-   * Blase entfernt hat, und alles einreihen, was sichtbar und noch nicht
-   * transkribiert ist.
-   *
-   * WhatsApp entfernt weit weggescrollte Nachrichten aus dem DOM. Der
-   * isConnected-Test siebt die deshalb billig aus, bevor ein
-   * getBoundingClientRect ein Layout erzwingt.
-   */
-  function sweep() {
-    for (const entry of registry.values()) {
-      if (!entry.bubble || !entry.bubble.isConnected) continue;
-      if (!entry.nodes || !entry.nodes.root.isConnected) mount(entry);
-      if (cfg.autoTranscribe && entry.state === "idle" && nearViewport(entry.bubble)) {
-        enqueue(entry.key);
-      }
     }
   }
 
@@ -432,13 +281,8 @@
       entry.stage = "Lade Audio";
       render(entry);
 
-      if (entry.forcePlayOnce) {
-        entry.forcePlayOnce = false;
-        await nudgePlay(entry.audio);
-      }
-
-      const audio = await readAudio(entry.audio);
-      log("Audio gelesen", entry.key, audio.size, "Bytes", audio.mime);
+      const audio = await bridge("audio", { id: entry.key });
+      log("Audio", entry.key, audio.size, "Bytes", audio.mime, "via", audio.weg);
 
       entry.stage = "Transkribiere";
       render(entry);
@@ -456,94 +300,106 @@
       entry.state = "done";
       entry.expanded = cfg.expandFullByDefault;
     } catch (err) {
-      if (err && err.code === "needs-play") {
-        entry.state = "needs-play";
-      } else {
-        entry.state = "error";
-        entry.error = (err && err.message) || String(err);
-        log("Fehler bei", entry.key, entry.error);
-      }
+      entry.state = "error";
+      entry.error = (err && err.message) || String(err);
+      log("Fehler bei", entry.key, entry.error);
     }
     render(entry);
   }
 
   // ----------------------------------------------------- Entdeckung / Obs
 
-  /**
-   * Liegt das Element im oder nahe am sichtbaren Bereich?
-   *
-   * Bewusst ueber getBoundingClientRect statt IntersectionObserver: der
-   * Observer meldet in einem Hintergrundtab keine Schnittmenge, und genau
-   * dort steht WhatsApp Web die meiste Zeit. Das Layout existiert dagegen
-   * auch im Hintergrund, die Rechtecke stimmen also weiterhin.
-   */
   function nearViewport(el, margin = 600) {
     const r = el.getBoundingClientRect();
-    if (r.width === 0 && r.height === 0) return false; // ausgeblendet
+    if (r.width === 0 && r.height === 0) return false;
     const h = window.innerHeight || document.documentElement.clientHeight;
     return r.bottom > -margin && r.top < h + margin;
   }
 
-  function consider(audioEl) {
-    if (audioEl.dataset.watSeen === "1") return;
+  /**
+   * Einmal pro Sekunde: Panels zurueckholen, die React beim Neuaufbau der
+   * Blase entfernt hat, und alles einreihen, was sichtbar und noch nicht
+   * transkribiert ist.
+   *
+   * getBoundingClientRect statt IntersectionObserver: der meldet in einem
+   * Hintergrundtab keine Schnittmenge, und genau dort steht WhatsApp meistens.
+   */
+  function sweep() {
+    for (const entry of registry.values()) {
+      // Erst wenn WhatsApps Modell bestaetigt hat, dass es eine empfangene
+      // Sprachnachricht ist. Sonst blitzt an jeder Nachricht kurz ein Panel
+      // auf, auch an selbst gesendeten.
+      if (!entry.ready) continue;
+      if (!entry.bubble || !entry.bubble.isConnected) continue;
+      if (!entry.nodes || !entry.nodes.root.isConnected) mount(entry);
+      if (cfg.autoTranscribe && entry.state === "idle" && nearViewport(entry.bubble)) {
+        enqueue(entry.key);
+      }
+    }
+  }
 
-    const incoming = isIncoming(audioEl);
-    if (incoming === false) return; // selbst gesendet
-    const bubble = findBubble(audioEl);
-    if (!bubble) return;
-
-    audioEl.dataset.watSeen = "1";
-    const key = messageKeyOf(audioEl);
+  function consider(bubble) {
+    if (bubble.dataset.watSeen === "1") return;
+    const key = bubble.getAttribute("data-id");
+    if (!key) return;
+    bubble.dataset.watSeen = "1";
 
     const existing = registry.get(key);
     if (existing) {
-      // Gleiche Nachricht neu gerendert: DOM-Referenzen auffrischen,
-      // Ergebnis behalten.
-      existing.audio = audioEl;
+      // Gleiche Nachricht neu gerendert: DOM-Referenz auffrischen, Ergebnis behalten.
       existing.bubble = bubble;
       existing.nodes = null;
       mount(existing);
-      bubble.dataset.watKey = key;
       return;
     }
 
     const entry = {
       key,
-      audio: audioEl,
       bubble,
-      // Nicht "idle": solange der lokale Cache noch antwortet, darf sweep()
-      // die Nachricht nicht einreihen — sonst liest sie das Audio aus und
-      // kodiert es, obwohl das Transkript langst vorliegt.
+      // Nicht "idle": solange Metadaten und Cache noch antworten, darf sweep()
+      // die Nachricht nicht einreihen.
       state: "cache",
       expanded: cfg.expandFullByDefault,
       data: null,
       nodes: null,
     };
     registry.set(key, entry);
-    bubble.dataset.watKey = key;
-    mount(entry);
 
-    // Bereits transkribiert? Dann sofort anzeigen, ohne Backend.
-    chrome.runtime
-      .sendMessage({ type: "wat:cache-get", key })
-      .then((res) => {
-        if (res && res.ok && res.data) {
-          entry.data = res.data;
-          entry.state = "done";
-        } else {
-          entry.state = "idle";
-        }
-      })
-      .catch(() => {
+    Promise.all([
+      bridge("info", { id: key }, 15000).catch((e) => {
+        log("info fehlgeschlagen", key, e.message);
+        return null;
+      }),
+      chrome.runtime.sendMessage({ type: "wat:cache-get", key }).catch(() => null),
+    ]).then(([info, cached]) => {
+      // WhatsApps eigenes Modell entscheidet, nicht DOM-Raterei: nur
+      // empfangene Sprachnachrichten.
+      if (!info || !info.found || info.fromMe || info.type !== "ptt") {
+        registry.delete(key);
+        return;
+      }
+      entry.ready = true;
+      mount(entry);
+      if (cached && cached.ok && cached.data) {
+        entry.data = cached.data;
+        entry.state = "done";
+      } else {
         entry.state = "idle";
-      })
-      .finally(() => render(entry));
+      }
+      render(entry);
+    });
   }
 
   function scan(root) {
     const scope = root && root.querySelectorAll ? root : document;
-    scope.querySelectorAll(SELECTORS.audio).forEach((el) => consider(el));
-    if (root instanceof HTMLAudioElement) consider(root);
+    scope.querySelectorAll(SELECTORS.voiceIcon).forEach((icon) => {
+      const bubble = icon.closest(SELECTORS.message);
+      if (bubble) consider(bubble);
+    });
+    if (root instanceof Element && root.matches && root.matches(SELECTORS.voiceIcon)) {
+      const bubble = root.closest(SELECTORS.message);
+      if (bubble) consider(bubble);
+    }
   }
 
   function start() {
@@ -559,7 +415,15 @@
     obs.observe(document.body, { childList: true, subtree: true });
 
     setInterval(sweep, 1000);
-    sweep(); // nicht erst eine Sekunde warten
+    sweep();
+
+    // Selbstdiagnose: beantwortet beim Debuggen sofort die Frage, ob der
+    // Zugriff auf WhatsApps Modulsystem ueberhaupt noch traegt.
+    if (cfg.debug) {
+      bridge("selftest", {}, 15000)
+        .then((r) => log("Selbsttest:", r))
+        .catch((e) => console.warn("[WA-Transkript] Selbsttest fehlgeschlagen:", e.message));
+    }
     log("gestartet");
   }
 

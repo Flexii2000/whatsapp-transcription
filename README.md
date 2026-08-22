@@ -229,33 +229,54 @@ Nicht im Chrome Web Store, also als entpackte Erweiterung:
 
 ## Wie die WhatsApp-Anbindung funktioniert
 
-WhatsApp Web hat keine stabilen CSS-Klassen. Die Extension hängt sich deshalb
-an das, was ein Redesign überlebt: das `<audio>`-Element.
+**WhatsApp Web hat kein `<audio>`-Element für Sprachnachrichten.** Die
+Wellenform ist ein `<canvas>`, abgespielt wird über die Web-Audio-API, und im
+DOM steht nirgends eine `blob:`-URL. Aus dem DOM kommt man an die Audiodaten
+also überhaupt nicht heran.
 
-| Schritt | Wie |
+Erreichbar sind sie über WhatsApps eigenes Modulsystem. `window.require()`
+nimmt im Seitenkontext Haste-Modulnamen entgegen:
+
+| Modul | wofür |
 |---|---|
-| Sprachnachricht finden | Alle `<audio>` im DOM, per `MutationObserver` auch neu hinzukommende |
-| Eingehend? | `.message-in`, ersatzweise `data-id`-Präfix `false_` |
-| Identität | Das `data-id` der Blase (`<fromMe>_<chatId>_<msgId>`) — stabil über Reloads, dient als Cache-Schlüssel |
-| Audiobytes | `audio.src` ist eine `blob:`-URL. Erst direkter `fetch` aus dem Isolated World, bei Fehlschlag über `page-bridge.js` im Seitenkontext |
-| Einhängen | Vor der Zeitstempel-Zeile, damit die Uhrzeit unten rechts bleibt |
-| Auslösen | `getBoundingClientRect` im Sekundentakt, **nicht** `IntersectionObserver` — der meldet in einem Hintergrundtab keine Sichtbarkeit, und genau dort steht WhatsApp meistens |
+| `WAWebMsgCollection` | Nachrichtenspeicher — liefert das Modell zu einer `data-id` |
+| `WAWebDownloadManager` | Herunterladen und Entschlüsseln der Medien |
 
-Alle Selektoren stehen gebündelt im `SELECTORS`-Block ganz oben in
-`extension/src/content.js`. Wenn WhatsApp etwas umbaut, ist das die einzige
-Stelle, die angefasst werden muss.
+Damit ergibt sich die Arbeitsteilung:
+
+| Schritt | Wo | Wie |
+|---|---|---|
+| Blasen finden | `content.js` | `[data-id]`, die ein `[data-icon="ptt-status"]` enthalten |
+| Eingehend? Sprachnachricht? | `page-bridge.js` | aus WhatsApps Modell (`id.fromMe`, `type === "ptt"`) — **nicht** aus dem DOM |
+| Audiodaten | `page-bridge.js` | `msg.downloadMedia()`, danach der Blob aus `mediaData` |
+| Einhängen | `content.js` | vor die Zeitstempel-Zeile, damit die Uhrzeit unten rechts bleibt |
+| Auslösen | `content.js` | `getBoundingClientRect` im Sekundentakt — **nicht** `IntersectionObserver`, der meldet in einem Hintergrundtab nichts |
+
+### Was daran zerbrechlich ist
+
+Das ist Reverse Engineering, und WhatsApp kann Modul- oder Feldnamen jederzeit
+ändern. Zwei Vorkehrungen dagegen:
+
+- `mediaBlobOf()` in `page-bridge.js` probiert **mehrere bekannte Ablageorte**
+  des entschlüsselten Blobs durch und meldet im Debug-Modus, welcher getragen
+  hat. Eine spätere Anpassung ist damit eine Frage von Minuten statt einer
+  neuen Fehlersuche.
+- Ein **Selbsttest** läuft beim Start, wenn Debug-Ausgaben eingeschaltet sind,
+  und beantwortet sofort, ob der Zugriff überhaupt noch funktioniert:
+
+```
+[WA-Transkript] Selbsttest: {modulsystem: true, nachrichten: 1224,
+                             sprachnachrichten: 7, davonEingehend: 5,
+                             downloadManager: true}
+```
+
+Alle Klassennamen in WhatsApp Web sind obfuskiert (`x1n2onr6` & Co., Facebooks
+Atomic-CSS) und wechseln ständig — deshalb hängt nichts an Klassen, sondern nur
+an `data-id`, `data-icon` und der Struktur. Was sich ändern kann, steht
+gebündelt im `SELECTORS`-Block oben in `content.js`.
 
 React baut Blasen beim Scrollen neu auf und wirft dabei fremde Kinder heraus.
 Statt dagegen anzukämpfen hängt der Sekundentakt das Panel einfach wieder ein.
-
-### Wenn eine Nachricht noch nicht geladen ist
-
-WhatsApp legt die `blob:`-URL erst an, wenn das Medium entschlüsselt ist.
-Passiert das nicht von allein, zeigt das Panel **„Laden & transkribieren"**.
-
-Der Schalter *„Noch nicht geladene Memos automatisch nachladen"* erledigt das
-ohne Nachfrage — **erzeugt dabei aber eine Abhör-Bestätigung**, der Absender
-sieht das blaue Mikrofon. Deshalb ist er standardmäßig aus.
 
 ---
 
