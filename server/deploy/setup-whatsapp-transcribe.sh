@@ -12,6 +12,31 @@
 # ~/scripts/fix-docker-gpu.sh muss einmalig mit sudo laufen.
 set -euo pipefail
 
+# --------------------------------------------------------------------------
+# Dieses Skript laeuft als flexii, NICHT mit sudo.
+#
+# Gegenstueck: fix-docker-gpu.sh braucht zwingend Root. Die beiden sind also
+# genau andersherum — deshalb hier ein harter Wachposten statt einer Notiz.
+# --------------------------------------------------------------------------
+if [ "$(id -u)" -eq 0 ]; then
+    cat >&2 <<'ROOT'
+FEHLER: Bitte OHNE sudo ausfuehren.
+
+  Warum:
+    - Der git-Clone braucht den GitHub-SSH-Key des Users. Root hat ihn nicht.
+    - Alles, was root hier anlegt, gehoert danach root — spaetere Updates
+      ohne sudo waeren damit unmoeglich.
+    - Docker laeuft auf diesem Host ohnehin ohne sudo.
+
+  Richtig:
+      ~/scripts/setup-whatsapp-transcribe.sh
+
+  Mit sudo laeuft nur:
+      sudo ~/scripts/fix-docker-gpu.sh
+ROOT
+    exit 1
+fi
+
 REPO_URL="git@github.com:Flexii2000/whatsapp-transcription.git"
 REPO_DIR="$HOME/services/whatsapp-transcribe"
 APP_DIR="$REPO_DIR/server"
@@ -117,6 +142,16 @@ fi
 step "Quellen"
 
 mkdir -p "$HOME/services" "$SCRIPTS_DIR"
+
+# Ein frueherer sudo-Lauf kann root-eigene Reste hinterlassen haben, an denen
+# spaeter jedes git pull und jedes Schreiben scheitert.
+if [ -e "$REPO_DIR" ]; then
+    foreign=$(find "$REPO_DIR" ! -user "$(id -un)" -print -quit 2>/dev/null || true)
+    [ -n "$foreign" ] && die "In $REPO_DIR liegen Dateien, die dir nicht gehoeren
+       (z. B. $foreign) — vermutlich von einem frueheren sudo-Lauf.
+       Einmalig geradeziehen mit:
+         sudo chown -R $(id -un):$(id -gn) $REPO_DIR"
+fi
 
 if [ -d "$REPO_DIR/.git" ]; then
     git -C "$REPO_DIR" pull --ff-only

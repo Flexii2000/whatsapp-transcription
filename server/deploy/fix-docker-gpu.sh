@@ -48,7 +48,9 @@ ok()   { echo "  ${G}OK${N}   $*"; }
 warn() { echo "  ${Y}!${N}    $*"; }
 die()  { echo "  ${R}FEHLER${N} $*" >&2; exit 1; }
 
-[ "$CHECK" = 1 ] || [ "$(id -u)" -eq 0 ] || die "Bitte mit sudo ausfuehren (oder --check)."
+# Dieses Skript ist das einzige der drei, das Root braucht — es schreibt nach
+# /var/snap/docker/. setup- und update-* laufen umgekehrt als flexii.
+[ "$CHECK" = 1 ] || [ "$(id -u)" -eq 0 ] || die "Bitte MIT sudo ausfuehren (oder --check ohne)."
 
 # ------------------------------------------------------------------ Befund
 

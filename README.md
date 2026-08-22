@@ -70,9 +70,20 @@ Das erledigt ein Skript. Einmal von Hand holen, danach macht es den Rest:
 ```bash
 ssh HeimServerLocal          # oder HeimServerRemote von außerhalb
 
-# Erstinstallation
+# Erstinstallation — OHNE sudo!
 ~/scripts/setup-whatsapp-transcribe.sh
 ```
+
+> **Wer läuft mit welchen Rechten?** Die drei Skripte sind gegensätzlich, und
+> beide Richtungen sind hart abgesichert:
+>
+> | Skript | Rechte | Warum |
+> |---|---|---|
+> | `setup-whatsapp-transcribe.sh` | **als `flexii`** | Der Clone braucht deinen GitHub-Key, den root nicht hat. Und was root anlegt, gehört danach root — spätere Updates ohne sudo wären unmöglich |
+> | `update-whatsapp-transcribe.sh` | **als `flexii`** | dito |
+> | `fix-docker-gpu.sh` | **mit `sudo`** | schreibt nach `/var/snap/docker/` |
+>
+> Docker läuft auf diesem Host ohne sudo, das ist also kein Grund dafür.
 
 Das Skript prüft Docker, Port und Plattenplatz, klont das Repo nach
 `~/services/whatsapp-transcribe`, erzeugt eine `.env` mit frischem

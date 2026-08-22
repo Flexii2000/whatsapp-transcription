@@ -10,6 +10,31 @@
 # schlagen fehl. Deshalb liegt der Dienst unter ~/services/.
 set -euo pipefail
 
+# --------------------------------------------------------------------------
+# Dieses Skript laeuft als flexii, NICHT mit sudo.
+#
+# Gegenstueck: fix-docker-gpu.sh braucht zwingend Root. Die beiden sind also
+# genau andersherum — deshalb hier ein harter Wachposten statt einer Notiz.
+# --------------------------------------------------------------------------
+if [ "$(id -u)" -eq 0 ]; then
+    cat >&2 <<'ROOT'
+FEHLER: Bitte OHNE sudo ausfuehren.
+
+  Warum:
+    - Der git-Clone braucht den GitHub-SSH-Key des Users. Root hat ihn nicht.
+    - Alles, was root hier anlegt, gehoert danach root — spaetere Updates
+      ohne sudo waeren damit unmoeglich.
+    - Docker laeuft auf diesem Host ohnehin ohne sudo.
+
+  Richtig:
+      ~/scripts/update-whatsapp-transcribe.sh
+
+  Mit sudo laeuft nur:
+      sudo ~/scripts/fix-docker-gpu.sh
+ROOT
+    exit 1
+fi
+
 REPO_DIR="${REPO_DIR:-$HOME/services/whatsapp-transcribe}"
 APP_DIR="$REPO_DIR/server"
 PORT=8099
