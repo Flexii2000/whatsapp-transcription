@@ -34,6 +34,16 @@ docker compose build
 echo "==> docker compose up -d"
 docker compose up -d
 
+# COMPOSE_FILE steht in der .env, das Setup-Skript hat es dort hinterlegt.
+backend=$(grep -m1 "^SUMMARY_BACKEND=" .env | cut -d= -f2- | tr -d "[:space:]")
+llm_model=$(grep -m1 "^LLM_MODEL=" .env | cut -d= -f2- | tr -d "[:space:]")
+if [ "$backend" = "local" ] && [ -n "$llm_model" ]; then
+    if ! docker compose exec -T llm ollama list 2>/dev/null | awk "NR>1{print \$1}" | grep -qx "$llm_model"; then
+        echo "==> Sprachmodell $llm_model fehlt, wird geladen"
+        docker compose exec -T llm ollama pull "$llm_model"
+    fi
+fi
+
 echo "==> warte auf /health"
 for i in $(seq 1 60); do
     if body=$(curl -fsS --max-time 5 "http://127.0.0.1:$PORT/health" 2>/dev/null); then

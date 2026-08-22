@@ -8,7 +8,8 @@
 #
 # Was es NICHT tut: alles was Root braucht. Der User hat hier kein
 # passwortloses sudo, deshalb druckt das Skript die nginx-Schritte am Ende
-# nur aus, statt sie auszufuehren.
+# nur aus, statt sie auszufuehren. Fuer die GPU gilt dasselbe —
+# ~/scripts/fix-docker-gpu.sh muss einmalig mit sudo laufen.
 set -euo pipefail
 
 REPO_URL="git@github.com:Flexii2000/whatsapp-transcription.git"
@@ -16,6 +17,7 @@ REPO_DIR="$HOME/services/whatsapp-transcribe"
 APP_DIR="$REPO_DIR/server"
 SCRIPTS_DIR="$HOME/scripts"
 PORT=8099
+LLM_PORT=11500
 PUBLIC_URL="https://fherrmann.com/whisper"
 
 DRY_RUN=0
@@ -36,6 +38,20 @@ ok()   { echo "  ${G}OK${N}   $*"; }
 warn() { echo "  ${Y}!${N}    $*"; }
 die()  { echo "  ${R}FEHLER${N} $*" >&2; exit 1; }
 
+port_busy() { ss -ltn 2>/dev/null | grep -q "127.0.0.1:$1 "; }
+mine()      { docker ps --format '{{.Names}}' | grep -qx "$1"; }
+
+# Laesst sich die GPU aus einem Container nutzen? Bewusst mit einem Image,
+# das ohnehin lokal liegt oder winzig ist — der Test darf nichts kosten.
+gpu_usable() {
+    docker info 2>/dev/null | grep -q ' nvidia' || return 1
+    command -v nvidia-smi >/dev/null 2>&1 || return 1
+    docker run --rm --runtime=nvidia \
+        -e NVIDIA_VISIBLE_DEVICES=all \
+        -e NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+        ubuntu:22.04 nvidia-smi -L >/dev/null 2>&1
+}
+
 # --------------------------------------------------------------- Vorpruefung
 
 step "Vorprüfung"
@@ -47,20 +63,36 @@ ok "docker erreichbar"
 docker compose version >/dev/null 2>&1 || die "'docker compose' (v2) fehlt."
 ok "docker compose v2 vorhanden"
 
-if ss -ltn 2>/dev/null | grep -q "127.0.0.1:$PORT "; then
-    if docker ps --format '{{.Names}}' | grep -qx whatsapp-transcribe; then
-        ok "Port $PORT ist vom eigenen Container belegt"
+for p in "$PORT:whatsapp-transcribe" "$LLM_PORT:whatsapp-transcribe-llm"; do
+    prt=${p%%:*}; name=${p##*:}
+    if port_busy "$prt"; then
+        mine "$name" && ok "Port $prt gehört dem eigenen Container" \
+                     || die "Port $prt ist von etwas anderem belegt."
     else
-        die "Port $PORT ist von etwas anderem belegt."
+        ok "Port $prt ist frei"
     fi
-else
-    ok "Port $PORT ist frei"
-fi
+done
 
 free_gb=$(df -BG --output=avail "$HOME" | tail -1 | tr -dc '0-9')
-[ "${free_gb:-0}" -ge 10 ] \
-    && ok "${free_gb} GB frei (Modell + Image brauchen ~6 GB)" \
-    || warn "nur ${free_gb} GB frei — Modell und Image brauchen ~6 GB"
+[ "${free_gb:-0}" -ge 15 ] \
+    && ok "${free_gb} GB frei (Images + Whisper- und LLM-Modell brauchen ~12 GB)" \
+    || warn "nur ${free_gb} GB frei — Images und Modelle brauchen ~12 GB"
+
+step "GPU"
+if gpu_usable; then
+    GPU=1
+    ok "$(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader)"
+    ok "aus Containern nutzbar — Whisper und LLM laufen auf der Karte"
+else
+    GPU=0
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        warn "GPU vorhanden, aber aus Containern nicht nutzbar."
+        warn "Einmalig reparieren mit:  sudo ~/scripts/fix-docker-gpu.sh"
+        warn "Bis dahin läuft alles auf der CPU (langsamer, funktioniert aber)."
+    else
+        warn "keine NVIDIA-GPU — CPU-Betrieb"
+    fi
+fi
 
 if [ "$DRY_RUN" = 1 ]; then
     step "Bestandsaufnahme (--check: es wird nichts verändert)"
@@ -68,18 +100,13 @@ if [ "$DRY_RUN" = 1 ]; then
                            || warn "Repo fehlt — würde geklont: $REPO_DIR"
     [ -f "$APP_DIR/.env" ]  && ok ".env vorhanden — bliebe unangetastet" \
                            || warn ".env fehlt — würde mit neuem AUTH_TOKEN angelegt"
-    if docker ps --format '{{.Names}}' | grep -qx whatsapp-transcribe; then
-        ok "Container läuft bereits"
-    else
-        warn "Container läuft nicht — würde gebaut und gestartet"
-    fi
+    mine whatsapp-transcribe     && ok "Backend-Container läuft"     || warn "Backend-Container läuft nicht"
+    mine whatsapp-transcribe-llm && ok "LLM-Container läuft"         || warn "LLM-Container läuft nicht"
     [ -f /etc/nginx/snippets/whisper.conf ] && ok "nginx-Snippet installiert" \
                                            || warn "nginx-Snippet fehlt (braucht Root)"
-    if grep -qs 'snippets/whisper.conf' /etc/nginx/sites-available/fherrmann.com; then
-        ok "include-Zeile in fherrmann.com vorhanden"
-    else
-        warn "include-Zeile in fherrmann.com fehlt (braucht Root)"
-    fi
+    grep -qs 'snippets/whisper.conf' /etc/nginx/sites-available/fherrmann.com \
+        && ok "include-Zeile in fherrmann.com vorhanden" \
+        || warn "include-Zeile in fherrmann.com fehlt (braucht Root)"
     echo
     echo "  Ohne --check würde das Skript den Rest einrichten."
     exit 0
@@ -100,16 +127,19 @@ else
     ok "Repo geklont nach $REPO_DIR"
 fi
 
-for s in setup update; do
-    src="$APP_DIR/deploy/$s-whatsapp-transcribe.sh"
-    dst="$SCRIPTS_DIR/$s-whatsapp-transcribe.sh"
+for s in setup update fix-docker-gpu; do
+    case "$s" in
+        fix-docker-gpu) src="$APP_DIR/deploy/fix-docker-gpu.sh"; dst="$SCRIPTS_DIR/fix-docker-gpu.sh" ;;
+        *)              src="$APP_DIR/deploy/$s-whatsapp-transcribe.sh"
+                        dst="$SCRIPTS_DIR/$s-whatsapp-transcribe.sh" ;;
+    esac
     # Nur bei Unterschied anfassen: dieses Skript kann sich sonst selbst
     # unter den Füßen wegziehen, während bash noch daraus liest.
     if cmp -s "$src" "$dst"; then
-        ok "$dst ist aktuell"
+        ok "$(basename "$dst") ist aktuell"
     else
         install -m 755 "$src" "$dst"
-        ok "$dst aktualisiert"
+        ok "$(basename "$dst") aktualisiert"
     fi
 done
 
@@ -117,47 +147,71 @@ done
 
 step "Konfiguration"
 
-if [ -f "$APP_DIR/.env" ]; then
+cd "$APP_DIR"
+
+if [ -f .env ]; then
     ok ".env existiert bereits — bleibt unangetastet"
 else
     umask 077
-    cp "$APP_DIR/.env.example" "$APP_DIR/.env"
-    token=$(openssl rand -hex 32)
-    sed -i "s|^AUTH_TOKEN=.*|AUTH_TOKEN=$token|" "$APP_DIR/.env"
+    cp .env.example .env
+    sed -i "s|^AUTH_TOKEN=.*|AUTH_TOKEN=$(openssl rand -hex 32)|" .env
     ok "AUTH_TOKEN erzeugt und eingetragen"
-
-    # Der Key wird nur eingelesen, wenn wirklich jemand am Terminal sitzt,
-    # und niemals angezeigt oder protokolliert.
-    if [ -t 0 ]; then
-        echo
-        echo "  Anthropic-API-Key für die Stichpunkt-Zusammenfassung."
-        echo "  Leer lassen und Enter drücken = nur Transkripte, keine Stichpunkte."
-        printf "  Key (Eingabe bleibt unsichtbar): "
-        read -rs key || key=""
-        echo
-        if [ -n "$key" ]; then
-            sed -i "s|^ANTHROPIC_API_KEY=.*|ANTHROPIC_API_KEY=$key|" "$APP_DIR/.env"
-            ok "API-Key eingetragen"
-        else
-            warn "Kein Key — Stichpunkte bleiben aus, Transkripte laufen"
-        fi
-        unset key
-    fi
+    ok "SUMMARY_BACKEND=local — die Stichpunkte macht das eigene Ollama"
 fi
-chmod 600 "$APP_DIR/.env"
+chmod 600 .env
 
-grep -q '^AUTH_TOKEN=.\+' "$APP_DIR/.env" || die "AUTH_TOKEN fehlt in $APP_DIR/.env"
-grep -q '^ANTHROPIC_API_KEY=.\+' "$APP_DIR/.env" \
-    || warn "ANTHROPIC_API_KEY ist leer — es gibt nur Transkripte"
+# COMPOSE_FILE in der .env sorgt dafür, dass auch ein blankes
+# `docker compose ...` im Ordner die richtige Kombination nimmt.
+if [ "$GPU" = 1 ]; then
+    want="docker-compose.yml:docker-compose.gpu.yml"
+else
+    want="docker-compose.yml"
+fi
+if grep -q '^COMPOSE_FILE=' .env; then
+    sed -i "s|^COMPOSE_FILE=.*|COMPOSE_FILE=$want|" .env
+else
+    printf 'COMPOSE_FILE=%s\n' "$want" >> .env
+fi
+ok "COMPOSE_FILE=$want"
+
+grep -q '^AUTH_TOKEN=.\+' .env || die "AUTH_TOKEN fehlt in $APP_DIR/.env"
+
+backend=$(grep -m1 '^SUMMARY_BACKEND=' .env | cut -d= -f2- | tr -d '[:space:]')
+llm_model=$(grep -m1 '^LLM_MODEL=' .env | cut -d= -f2- | tr -d '[:space:]')
+: "${llm_model:=qwen3:4b}"
+
+if [ "$backend" = "claude" ] && ! grep -q '^ANTHROPIC_API_KEY=.\+' .env; then
+    warn "SUMMARY_BACKEND=claude, aber kein ANTHROPIC_API_KEY — es gibt nur Transkripte"
+fi
 
 # -------------------------------------------------------------------- Bauen
 
 step "Container bauen und starten"
-echo "  Beim ersten Mal dauert das einige Minuten (Image + Whisper-Modell ~1,6 GB)."
-cd "$APP_DIR"
+echo "  Beim ersten Mal dauert das einige Minuten (Images + Whisper-Modell ~1,6 GB)."
 docker compose build
 docker compose up -d
-ok "Container läuft"
+ok "Container laufen"
+
+# ---------------------------------------------------------------- LLM-Modell
+
+if [ "$backend" = "local" ]; then
+    step "Sprachmodell $llm_model bereitstellen"
+
+    for i in $(seq 1 30); do
+        docker compose exec -T llm ollama list >/dev/null 2>&1 && break
+        printf '.'; sleep 2
+        [ "$i" = 30 ] && { echo; die "LLM-Container antwortet nicht."; }
+    done
+    echo
+
+    if docker compose exec -T llm ollama list 2>/dev/null | awk 'NR>1{print $1}' | grep -qx "$llm_model"; then
+        ok "$llm_model liegt bereits vor"
+    else
+        echo "  Lade $llm_model herunter (einige GB, dauert ein paar Minuten) ..."
+        docker compose exec -T llm ollama pull "$llm_model"
+        ok "$llm_model geladen"
+    fi
+fi
 
 step "Warte auf /health"
 for i in $(seq 1 90); do
@@ -177,8 +231,8 @@ done
 step "nginx"
 
 need_nginx=0
-[ -f /etc/nginx/snippets/whisper.conf ]        || need_nginx=1
-[ -f /etc/nginx/conf.d/whisper-limits.conf ]   || need_nginx=1
+[ -f /etc/nginx/snippets/whisper.conf ]      || need_nginx=1
+[ -f /etc/nginx/conf.d/whisper-limits.conf ] || need_nginx=1
 grep -qs 'snippets/whisper.conf' /etc/nginx/sites-available/fherrmann.com || need_nginx=1
 
 if [ "$need_nginx" = 0 ] && curl -fsS --max-time 10 "$PUBLIC_URL/health" >/dev/null 2>&1; then
@@ -205,7 +259,10 @@ fi
 step "Für die Chrome-Extension"
 echo
 echo "  Adresse : $PUBLIC_URL"
-echo "  Token   : $(grep '^AUTH_TOKEN=' "$APP_DIR/.env" | cut -d= -f2-)"
+echo "  Token   : $(grep '^AUTH_TOKEN=' .env | cut -d= -f2-)"
 echo
+[ "$GPU" = 0 ] && command -v nvidia-smi >/dev/null 2>&1 && \
+    echo "  Tipp: sudo ~/scripts/fix-docker-gpu.sh schaltet die GPU frei, danach" && \
+    echo "        nochmal ~/scripts/setup-whatsapp-transcribe.sh laufen lassen." && echo
 echo "  Updates künftig mit: ~/scripts/update-whatsapp-transcribe.sh"
 echo

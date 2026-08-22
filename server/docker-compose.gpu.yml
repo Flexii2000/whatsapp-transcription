@@ -1,0 +1,31 @@
+# GPU-Overlay. Zusammen mit docker-compose.yml verwenden:
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+#
+# Voraussetzung: `docker run --runtime=nvidia ...` funktioniert auf dem Host.
+# Auf diesem Server war dafuer einmalig deploy/fix-docker-gpu.sh noetig — die
+# CDI-Spec des Docker-Snaps zeigte nach einem Snap-Update noch auf die alte
+# Revision.
+#
+# VRAM-Rechnung fuer die 6 GB der GTX 1660 SUPER:
+#   Whisper large-v3-turbo float16  ~2,0 GB (dauerhaft geladen)
+#   LLM 4B in Q4                    ~2,8 GB
+#   ------------------------------------------
+#   zusammen                        ~4,8 GB, passt mit Reserve
+# Ein 7B-Modell (~4,7 GB) passt NICHT zusaetzlich zu Whisper.
+
+services:
+  whatsapp-transcribe:
+    build:
+      dockerfile: Dockerfile.gpu
+    runtime: nvidia
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      WHISPER_DEVICE: cuda
+      WHISPER_COMPUTE_TYPE: float16
+
+  llm:
+    runtime: nvidia
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility

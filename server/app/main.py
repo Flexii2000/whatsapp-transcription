@@ -2,9 +2,9 @@
 WhatsApp Voice Transcribe — Backend.
 
 Nimmt eine Sprachnachricht (base64) entgegen, transkribiert sie lokal mit
-faster-whisper und laesst Claude daraus eine Executive Summary in
-Stichpunkten bauen. Der Anthropic-API-Key liegt ausschliesslich hier,
-nie in der Browser-Extension.
+faster-whisper und laesst daraus eine Executive Summary in Stichpunkten
+bauen. Welches Modell die Stichpunkte schreibt, entscheidet
+SUMMARY_BACKEND — siehe app/summarize.py.
 
 Datenhaltung, bewusst knapp gehalten:
   - Audio wird nur im Arbeitsspeicher verarbeitet und nie gespeichert.
@@ -12,6 +12,7 @@ Datenhaltung, bewusst knapp gehalten:
     Stichpunkte — optional mit Verfallsdatum (CACHE_TTL_DAYS).
   - Es wird nichts protokolliert, woraus sich Absender oder Inhalt
     rekonstruieren lassen.
+  - Mit SUMMARY_BACKEND=local verlaesst kein Byte den Server.
 """
 
 from __future__ import annotations
@@ -32,11 +33,12 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Literal
 
-import anthropic
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from starlette.responses import JSONResponse
+
+from app.summarize import Summarizer, build_summarizer
 
 log = logging.getLogger("wat")
 logging.basicConfig(
@@ -57,13 +59,9 @@ WHISPER_BEAM_SIZE = int(os.getenv("WHISPER_BEAM_SIZE", "5"))
 MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "1"))
 MAX_AUDIO_BYTES = int(os.getenv("MAX_AUDIO_BYTES", str(32 * 1024 * 1024)))
 
-SUMMARY_ENABLED = os.getenv("SUMMARY_ENABLED", "true").lower() not in ("0", "false", "no")
-SUMMARY_MODEL = os.getenv("SUMMARY_MODEL", "claude-opus-5")
-SUMMARY_EFFORT = os.getenv("SUMMARY_EFFORT", "low")
 # Unter dieser Wortzahl lohnt keine Zusammenfassung ("Ja passt, bis gleich").
 # Auf 0 setzen, wenn wirklich *jede* Nachricht Stichpunkte bekommen soll.
 SUMMARY_MIN_WORDS = int(os.getenv("SUMMARY_MIN_WORDS", "20"))
-SUMMARY_MAX_BULLETS = int(os.getenv("SUMMARY_MAX_BULLETS", "5"))
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
 CACHE_DB = DATA_DIR / "cache.sqlite3"
@@ -75,33 +73,6 @@ CACHE_TTL_DAYS = int(os.getenv("CACHE_TTL_DAYS", "0"))
 # ihrem Service-Worker heraus auf und braucht kein CORS; ein offenes "*"
 # waere nur unnoetige Angriffsflaeche.
 CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
-
-SYSTEM_PROMPT = """\
-Du fasst transkribierte WhatsApp-Sprachnachrichten fuer den Empfaenger zusammen.
-
-- Schreibe {min_b} bis {max_b} knappe Stichpunkte in der Sprache des Transkripts.
-- Der erste Stichpunkt ist die Kernaussage der Nachricht.
-- Konkretes zuerst: Termine, Uhrzeiten, Orte, Zahlen, Namen, Zusagen, Absagen.
-- Was der Empfaenger tun oder beantworten soll, stellst du mit "-> " voran.
-- Keine Einleitung, keine Meta-Kommentare ("Die Person sagt ..."), keine Floskeln.
-- Offensichtliche Transkriptionsfehler interpretierst du stillschweigend sinnvoll,
-  ohne sie zu erwaehnen. Was du nicht verstehst, laesst du weg statt zu raten.
-- Jeder Stichpunkt steht ohne Aufzaehlungszeichen da, die Darstellung uebernimmt das UI.
-"""
-
-SUMMARY_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "summary": {
-            "type": "array",
-            "items": {"type": "string"},
-            "minItems": 1,
-            "maxItems": SUMMARY_MAX_BULLETS,
-        }
-    },
-    "required": ["summary"],
-    "additionalProperties": False,
-}
 
 # --------------------------------------------------------------------------
 # Cache (SQLite, Key = sha256 der Audiobytes)
@@ -214,57 +185,10 @@ def _transcribe_sync(audio: bytes, language: str | None) -> tuple[str, str | Non
 
 
 # --------------------------------------------------------------------------
-# Claude — Executive Summary
+# Zusammenfassung — Backend steckt in app/summarize.py
 # --------------------------------------------------------------------------
 
-_anthropic: anthropic.Anthropic | None = None
-
-
-def _summary_available() -> bool:
-    return SUMMARY_ENABLED and _anthropic is not None
-
-
-def _summarize_sync(transcript: str) -> list[str]:
-    """Gibt Stichpunkte zurueck. Bei jedem Problem: leere Liste, nie eine
-    Exception nach oben — ein fehlendes Summary darf das Transkript nicht
-    kaputt machen."""
-    assert _anthropic is not None
-    try:
-        resp = _anthropic.beta.messages.create(
-            model=SUMMARY_MODEL,
-            max_tokens=2000,
-            betas=["server-side-fallback-2026-07-01"],
-            fallbacks="default",
-            system=SYSTEM_PROMPT.format(min_b=1, max_b=SUMMARY_MAX_BULLETS),
-            output_config={
-                "effort": SUMMARY_EFFORT,
-                "format": {"type": "json_schema", "schema": SUMMARY_SCHEMA},
-            },
-            messages=[{"role": "user", "content": f"<transkript>\n{transcript}\n</transkript>"}],
-        )
-    except anthropic.APIError as exc:
-        log.warning("Claude-Aufruf fehlgeschlagen: %s", exc)
-        return []
-    except Exception as exc:  # noqa: BLE001
-        # Bewusst breit: ein aelteres SDK ohne `fallbacks`-Parameter wirft
-        # TypeError, kein APIError. Ein fertiges Transkript darf daran nicht
-        # sterben — die Stichpunkte sind das Extra, nicht das Produkt.
-        log.warning("Claude-Aufruf unerwartet gescheitert: %r", exc)
-        return []
-
-    if resp.stop_reason == "refusal":
-        detail = getattr(resp, "stop_details", None)
-        log.warning("Claude hat abgelehnt (%s)", getattr(detail, "category", None))
-        return []
-
-    try:
-        text = next(b.text for b in resp.content if b.type == "text")
-        bullets = json.loads(text)["summary"]
-    except (StopIteration, json.JSONDecodeError, KeyError, TypeError) as exc:
-        log.warning("Summary-Antwort nicht verwertbar: %s", exc)
-        return []
-
-    return [b.strip() for b in bullets if isinstance(b, str) and b.strip()]
+_summarizer: Summarizer | None = None
 
 
 # --------------------------------------------------------------------------
@@ -320,18 +244,12 @@ def _client_of(scope: Any) -> str:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _db, _model, _anthropic
+    global _db, _model, _summarizer
     _db = _db_init()
     if (purged := cache_purge()):
         log.info("Cache: %d abgelaufene Eintraege entfernt", purged)
 
-    key = os.getenv("ANTHROPIC_API_KEY", "").strip()
-    if SUMMARY_ENABLED and key:
-        _anthropic = anthropic.Anthropic(api_key=key)
-        log.info("Claude-Summary aktiv (%s, effort=%s)", SUMMARY_MODEL, SUMMARY_EFFORT)
-    elif SUMMARY_ENABLED:
-        log.warning("SUMMARY_ENABLED, aber ANTHROPIC_API_KEY fehlt — nur Transkript.")
-
+    _summarizer = build_summarizer()
     _model = await asyncio.to_thread(_load_model)
     yield
     if _db is not None:
@@ -381,8 +299,8 @@ async def health() -> dict[str, Any]:
         "ok": _model is not None,
         "whisper_model": WHISPER_MODEL,
         "device": WHISPER_DEVICE,
-        "summary": _summary_available(),
-        "summary_model": SUMMARY_MODEL if _summary_available() else None,
+        "summary": _summarizer.health() if _summarizer else {"backend": "?", "ready": False},
+        "summary_min_words": SUMMARY_MIN_WORDS,
         "cache_ttl_days": CACHE_TTL_DAYS or None,
     }
 
@@ -422,9 +340,9 @@ async def transcribe(req: TranscribeRequest) -> TranscribeResponse:
         return TranscribeResponse(transcript="", summary=[], language=lang, duration_sec=duration)
 
     summary: list[str] = []
-    if _summary_available() and len(transcript.split()) >= SUMMARY_MIN_WORDS:
+    if _summarizer is not None and len(transcript.split()) >= SUMMARY_MIN_WORDS:
         try:
-            summary = await asyncio.to_thread(_summarize_sync, transcript)
+            summary = await asyncio.to_thread(_summarizer.summarize, transcript)
         except Exception:  # noqa: BLE001
             log.exception("Summary-Schritt uebersprungen")
 

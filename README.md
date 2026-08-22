@@ -26,24 +26,36 @@ im selben optischen Feld.
 
 **Claude kann kein Audio.** Die Messages API nimmt `text`, `image`, `document`
 (PDF/Text) und `search_result` entgegen — es gibt keinen Audio-Content-Block.
-Das Transkribieren übernimmt deshalb **faster-whisper** auf dem Heimserver;
-Claude bekommt anschließend den fertigen Text und macht daraus die
-Stichpunkte.
+Transkribiert wird deshalb lokal mit **faster-whisper**; das Sprachmodell
+bekommt nur noch fertigen Text.
 
-Zweiter Grund für das Backend: Der Anthropic-API-Key liegt ausschließlich auf
-dem Server. Die Extension kennt nur die Backend-Adresse und einen eigenen
-Token — sie enthält kein einziges fremdes Secret.
+Wer die Stichpunkte schreibt, ist umschaltbar (`SUMMARY_BACKEND`):
+
+| | Kosten | Qualität | Daten |
+|---|---|---|---|
+| **`local`** (Standard) | keine | gut | nichts verlässt den Server |
+| `claude` | ~1 ct/Memo | beste | Transkript-Text geht an Anthropic |
+| `none` | keine | — | nur Transkript |
+
+Zweiter Grund für das Backend: die Extension enthält kein einziges fremdes
+Secret. Sie kennt nur die Backend-Adresse und einen eigenen Token.
 
 ```
-   Chrome                        Heimserver
-┌───────────────┐            ┌──────────────────────────┐
-│ content.js    │  Audio     │  faster-whisper          │
-│  findet <audio>├──────────► │      ↓ Transkript        │
-│  zeigt Panel  │  Bearer    │  Claude (opus-5)         │
-│               │ ◄──────────┤      ↓ Stichpunkte       │
-│ background.js │  JSON      │  SQLite-Cache (sha256)   │
-└───────────────┘            └──────────────────────────┘
+   Chrome                     Heimserver
+┌────────────────┐   Audio   ┌────────────────────────────────┐
+│ content.js     │──────────►│  faster-whisper  (GPU/CPU)     │
+│  findet <audio>│  Bearer   │        ↓ Transkript            │
+│  zeigt Panel   │           │  Ollama  qwen3:4b  (GPU/CPU)   │──┐
+│                │◄──────────│        ↓ Stichpunkte           │  │ eigener
+│ background.js  │   JSON    │  SQLite-Cache (sha256)         │  │ Container,
+└────────────────┘           └────────────────────────────────┘  │ Port 11500
+                                          │                      │
+                                          └── oder Anthropic-API ┘
 ```
+
+Das Ollama läuft als **eigener** Container (`whatsapp-transcribe-llm`, Port
+11500, eigener Modellspeicher) — unabhängig von einem eventuell schon
+vorhandenen `ollama` auf demselben Host.
 
 ---
 
@@ -85,6 +97,42 @@ vorhandenes Repo nur nachgezogen.
 ```bash
 ~/scripts/update-whatsapp-transcribe.sh     # git pull + rebuild + Healthcheck
 ```
+
+### GPU freischalten (einmalig, braucht Root)
+
+Der Server hat eine GTX 1660 SUPER, die brachliegt. Whisper fällt damit von
+~8 s auf ~2 s pro Memo, die Zusammenfassung von ~18 s auf ~5 s.
+
+```bash
+sudo ~/scripts/fix-docker-gpu.sh
+~/scripts/setup-whatsapp-transcribe.sh      # erkennt die GPU und stellt um
+```
+
+**Warum das nötig ist:** Der Docker-Snap bringt das NVIDIA-Container-Toolkit
+selbst mit, aber seine CDI-Spezifikation
+(`/var/snap/docker/current/etc/cdi/nvidia.yaml`) enthält den
+*revisionsgenauen* Snap-Pfad. Nach einem Snap-Update zeigt sie ins Leere und
+jeder `--runtime=nvidia`-Start scheitert mit
+
+```
+error running createContainer hook #0:
+fork/exec /snap/docker/3377/usr/bin/nvidia-ctk: no such file or directory
+```
+
+Das Skript erzeugt die Spec neu und schreibt die Pfade auf den stabilen
+`/snap/docker/current/`-Symlink um — damit übersteht sie künftige
+Snap-Updates. Der Docker-Daemon wird dabei **nicht** neu gestartet.
+
+**VRAM-Rechnung** für die 6 GB der Karte:
+
+| | |
+|---|---|
+| Whisper `large-v3-turbo` float16 | ~2,0 GB (dauerhaft geladen) |
+| `qwen3:4b` in Q4 | ~2,8 GB |
+| **zusammen** | **~4,8 GB** — passt mit Reserve |
+
+Ein 7B/8B-Modell (~5 GB) passt **nicht** zusätzlich zu Whisper. Wer eins
+will, setzt `WHISPER_DEVICE=cpu` und überlässt die Karte dem Sprachmodell.
 
 ### nginx — als Pfad unter `fherrmann.com`
 
@@ -194,8 +242,11 @@ sieht das blaue Mikrofon. Deshalb ist er standardmäßig aus.
 | Variable | Standard | Bedeutung |
 |---|---|---|
 | `AUTH_TOKEN` | — | **Pflicht.** Muss dem Token in der Extension entsprechen |
-| `ANTHROPIC_API_KEY` | — | Leer ⇒ nur Transkript, keine Stichpunkte |
+| `SUMMARY_BACKEND` | `local` | `local` / `claude` / `none` |
+| `LLM_MODEL` | `qwen3:4b` | Modell für `local`. Größer geht nur, wenn Whisper auf der CPU bleibt — siehe VRAM-Rechnung unten |
+| `ANTHROPIC_API_KEY` | — | Nur für `claude` |
 | `WHISPER_MODEL` | `large-v3-turbo` | Bei zu langsamem Server absteigend: `medium` → `small` → `base` |
+| `WHISPER_DEVICE` | `cpu` | Setzt `docker-compose.gpu.yml` auf `cuda` |
 | `WHISPER_LANGUAGE` | leer (auto) | `de` erzwingt Deutsch |
 | `SUMMARY_MIN_WORDS` | `20` | Darunter keine Stichpunkte — „Ja passt, bis gleich" braucht keine Zusammenfassung. `0` ⇒ wirklich immer |
 | `SUMMARY_MAX_BULLETS` | `5` | Obergrenze der Stichpunkte |
@@ -210,10 +261,13 @@ serverseitig auf einem Ausweichmodell, statt dir die Ablehnung zurückzugeben.
 
 ### Kosten
 
-Whisper läuft lokal und kostet nichts. Für Claude fallen pro Sprachnachricht
-grob 300–800 Input- und 60–150 Output-Token an — bei Opus-5-Preisen etwa
-**0,3–0,6 Cent pro Memo**. Der `sha256`-Cache auf dem Server sorgt dafür, dass
-dieselbe Nachricht nie zweimal bezahlt wird.
+Mit `SUMMARY_BACKEND=local` (Standard): **nichts**. Whisper und das
+Sprachmodell laufen beide auf dem eigenen Server.
+
+Mit `SUMMARY_BACKEND=claude`: rund **1 Cent pro Sprachnachricht** — grob
+300–800 Input- und 60–150 Output-Token, plus die Thinking-Token, die als
+Output abgerechnet werden. Der `sha256`-Cache sorgt dafür, dass dieselbe
+Nachricht nie zweimal bezahlt wird.
 
 > Ein claude.ai-Abo ist **kein** API-Zugang — API-Nutzung wird separat
 > abgerechnet.
@@ -229,12 +283,12 @@ dieselbe Nachricht nie zweimal bezahlt wird.
 | Audio | Nur in den Arbeitsspeicher des Containers. `faster-whisper` bekommt ein `BytesIO`, **keine Datei** | Bis der Request durch ist |
 | Transkript + Stichpunkte | SQLite auf dem Heimserver (`data/cache.sqlite3`) | `CACHE_TTL_DAYS`, Standard unbegrenzt |
 | Transkript + Stichpunkte | `chrome.storage.local` im Browser, max. 500 Einträge | Bis „Lokalen Cache leeren“ |
-| **Transkript-Text** | **Anthropic-API**, für die Zusammenfassung | Nach deren API-Bedingungen |
-| Audio | geht **nie** an Anthropic oder sonst irgendwohin | — |
+| Transkript-Text | **nur bei `SUMMARY_BACKEND=claude`**: an die Anthropic-API | Nach deren API-Bedingungen |
+| Audio | geht **nie** irgendwohin außer an deinen eigenen Server | — |
 
-Whisper läuft komplett lokal. Die einzige Übertragung nach außen ist der
-fertige **Text** an Claude — und die schaltest du mit `SUMMARY_ENABLED=false`
-komplett ab, dann verlässt gar nichts den Server.
+Im Standardbetrieb (`SUMMARY_BACKEND=local`) **verlässt kein einziges Byte
+den Heimserver** — weder Audio noch Transkript. Whisper und das Sprachmodell
+laufen beide in Containern auf deiner Maschine.
 
 Nicht protokolliert werden: Transkript-Inhalte und die WhatsApp-`message_id`
 (die enthält die Telefonnummer des Chatpartners). In den Logs stehen nur die
@@ -339,12 +393,17 @@ automatisch, allerdings ohne Zusammenfassung.
 ```
 server/
   app/main.py                        FastAPI: /health, /transcribe
-  Dockerfile, docker-compose.yml     Container (Port 127.0.0.1:8099)
+  app/summarize.py                   Stichpunkte: local / claude / none
+  Dockerfile                         CPU-Image
+  Dockerfile.gpu                     CUDA-Image (cuBLAS + cuDNN als Wheels)
+  docker-compose.yml                 Backend (:8099) + eigenes Ollama (:11500)
+  docker-compose.gpu.yml             Overlay: runtime nvidia, cuda/float16
   .env.example                       Konfigurationsvorlage
   deploy/
     nginx-whisper-location.conf      location-Block → snippets/whisper.conf
     nginx-whisper-limits.conf        Rate-Limit-Zonen → conf.d/
     setup-whatsapp-transcribe.sh     Erstinstallation (--check für Trockenlauf)
+    fix-docker-gpu.sh                repariert die GPU-Durchreichung (sudo)
     update-whatsapp-transcribe.sh    git pull + rebuild + Healthcheck
 
 extension/

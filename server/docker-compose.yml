@@ -1,18 +1,55 @@
+# CPU-Variante (Standard, laeuft ueberall).
+# Fuer die GPU zusaetzlich docker-compose.gpu.yml dazunehmen:
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+# Das Setup-Skript nimmt sie automatisch, wenn die GPU nutzbar ist.
+
 services:
   whatsapp-transcribe:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: whatsapp-transcribe
     restart: unless-stopped
     # Nur an localhost binden — nach aussen geht es ausschliesslich ueber nginx+TLS.
     ports:
       - "127.0.0.1:8099:8000"
     env_file: .env
+    environment:
+      # Innerhalb des Compose-Netzes heisst der LLM-Dienst schlicht "llm".
+      LLM_URL: http://llm:11434
     volumes:
       - ./data:/data
       - ./models:/models
+    depends_on:
+      - llm
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5).status == 200 else 1)"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 300s
+
+  # Eigene Ollama-Instanz, bewusst getrennt vom bereits vorhandenen
+  # ollama-Container auf dem Host: eigener Name, eigener Port, eigener
+  # Modellspeicher. Wir fassen den anderen nicht an und er uns nicht.
+  llm:
+    image: ollama/ollama:0.13.0
+    container_name: whatsapp-transcribe-llm
+    restart: unless-stopped
+    ports:
+      # 11434/11435 sind auf diesem Host schon belegt.
+      - "127.0.0.1:11500:11434"
+    environment:
+      # Modell im Speicher halten, damit nicht jede Nachricht das Laden zahlt.
+      OLLAMA_KEEP_ALIVE: "30m"
+      # Eine Zusammenfassung zur Zeit reicht — MAX_CONCURRENCY ist auch 1.
+      OLLAMA_NUM_PARALLEL: "1"
+      OLLAMA_MAX_LOADED_MODELS: "1"
+    volumes:
+      - ./llm-models:/root/.ollama
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
