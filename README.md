@@ -72,46 +72,55 @@ Der erste Start lädt das Whisper-Modell herunter (`large-v3-turbo`, ~1,6 GB)
 — das dauert einige Minuten. Das Skript wartet darauf und zeigt am Ende die
 `/health`-Antwort.
 
-### nginx + TLS — Reihenfolge beachten
+### nginx — als Pfad unter `fherrmann.com`
 
-Braucht Root, also selbst am Terminal. **Zwei Stufen**, und die Reihenfolge
-ist nicht optional: die Vollversion verweist auf Zertifikatsdateien, die es
-vorher noch nicht gibt, und lässt `nginx -t` sonst fehlschlagen. Umgekehrt
-braucht certbot einen Port-80-Block für diesen Hostnamen — ohne den bekommt
-die HTTP-01-Challenge auf diesem Server keine Antwort.
+Kein eigener Hostname, kein certbot, kein DNS: der Dienst haengt sich unter
+`https://fherrmann.com/whisper/` in das vorhandene Zertifikat ein — dasselbe
+Muster wie `/wahlen` und `/aspria/`.
+
+Zwei Dateien kopieren und eine Zeile einfuegen (braucht Root, also selbst am
+Terminal):
 
 ```bash
-# Stufe 1: nur Port 80, damit certbot durchkommt
-sudo cp deploy/nginx-whatsapp-transcribe-bootstrap.conf \
-        /etc/nginx/sites-available/whatsapp-transcribe
-sudo ln -s /etc/nginx/sites-available/whatsapp-transcribe /etc/nginx/sites-enabled/
-sudo nginx -t && sudo systemctl reload nginx
+# Rate-Limit-Zonen — gehoeren in den http-Kontext, deshalb conf.d/
+sudo cp deploy/nginx-whisper-limits.conf /etc/nginx/conf.d/whisper-limits.conf
 
-# Zertifikat holen
-sudo certbot certonly --webroot -w /var/www/html -d whisper.fherrmann.com
-
-# Stufe 2: Vollversion mit TLS, Timeouts und Rate-Limits
-sudo cp deploy/nginx-whatsapp-transcribe.conf \
-        /etc/nginx/sites-available/whatsapp-transcribe
-sudo nginx -t && sudo systemctl reload nginx
+# Der location-Block
+sudo cp deploy/nginx-whisper-location.conf /etc/nginx/snippets/whisper.conf
 ```
 
-Zwei Eigenheiten dieses Servers, beide verifiziert:
+Dann in `/etc/nginx/sites-available/fherrmann.com` **in den 443-Serverblock**,
+direkt neben die schon vorhandene `wahlen`-Zeile:
 
-- Die Jellyfin-Configs fangen mit `server_name _;` unbekannte Hostnamen ab.
-  Ohne eigenen Block landet `whisper.fherrmann.com` dort und liefert ein
-  **falsches Zertifikat** aus. Mit eigenem Block unkritisch — nginx bevorzugt
-  den exakten `server_name`-Treffer immer vor dem Default-Server.
-- Auf Port 80 antwortet für unbekannte Hostnamen gar nichts (`Empty reply`),
-  während `fherrmann.com` sauber 301 liefert. Genau deshalb Stufe 1 zuerst.
+```nginx
+    include /etc/nginx/snippets/wahlen.conf;
+    include /etc/nginx/snippets/whisper.conf;   # <- neu
+```
+
+```bash
+sudo nginx -t && sudo systemctl reload nginx
+curl -s https://fherrmann.com/whisper/health
+```
+
+Der `location`-Block benutzt an beiden Stellen einen abschliessenden Slash
+(`location /whisper/` + `proxy_pass http://127.0.0.1:8099/;`). Damit
+schneidet nginx das Praefix ab: aus `/whisper/transcribe` wird `/transcribe`.
+Das ist der Unterschied zu `wahlen.conf`, wo der Pfad absichtlich stehen
+bleibt, weil die Spring-App ihn als context-path selbst erwartet.
+
+> Der Umweg ueber eine eigene Subdomain entfaellt damit vollstaendig. Das ist
+> hier auch der robustere Weg: die Jellyfin-Configs fangen mit
+> `server_name _;` unbekannte Hostnamen ab, und auf Port 80 antwortet dieser
+> Server fuer unbekannte Hostnamen gar nichts — certbots HTTP-01-Challenge
+> waere ohne Vorarbeit fehlgeschlagen.
 
 ### Nach dem Deploy: `SERVER-CONTEXT.md` nachziehen
 
-In die Tabelle *fherrmann.com — eigene Projekte* gehört dann:
+In die Tabelle *fherrmann.com — eigene Projekte* gehoert dann:
 
 | Domain | Was | Server-Pfad | Repo |
 |---|---|---|---|
-| `whisper.fherrmann.com` | Sprachmemo-Transkription (faster-whisper + Claude), Proxy auf `:8099` | `~/services/whatsapp-transcribe` (**nicht** `/opt` — Snap-Docker!) | `git@github.com:Flexii2000/whatsapp-transcription.git` — lokal: `~/Server-Projects/whatsapp-transcription`. Update: `~/scripts/update-whatsapp-transcribe.sh` |
+| `fherrmann.com/whisper` | Sprachmemo-Transkription (faster-whisper + Claude), Proxy auf `:8099` | `~/services/whatsapp-transcribe` (**nicht** `/opt` — Snap-Docker!) | `git@github.com:Flexii2000/whatsapp-transcription.git` — lokal: `~/Server-Projects/whatsapp-transcription`. Update: `~/scripts/update-whatsapp-transcribe.sh`. nginx: `snippets/whisper.conf` + `conf.d/whisper-limits.conf` |
 
 ---
 
@@ -123,10 +132,10 @@ Nicht im Chrome Web Store, also als entpackte Erweiterung:
 2. **Entwicklermodus** oben rechts einschalten
 3. **Entpackte Erweiterung laden** → Ordner `extension/` auswählen
 4. Die Optionsseite öffnet sich automatisch. Eintragen:
-   - **Adresse**: `https://whisper.fherrmann.com`
+   - **Adresse**: `https://fherrmann.com/whisper` (ohne Slash am Ende)
    - **Token**: derselbe Wert wie `AUTH_TOKEN` in der `.env`
 5. **Zugriff erlauben** klicken — Chrome fragt nach der Berechtigung für
-   die Backend-Domain. Ohne das blockiert Chrome die Anfragen.
+   `https://fherrmann.com/whisper/*`. Ohne das blockiert Chrome die Anfragen.
 6. **Verbindung testen** — muss Modell und Claude-Status melden.
 7. **Speichern**, dann `web.whatsapp.com` neu laden.
 
@@ -319,8 +328,8 @@ server/
   Dockerfile, docker-compose.yml     Container (Port 127.0.0.1:8099)
   .env.example                       Konfigurationsvorlage
   deploy/
-    nginx-whatsapp-transcribe-bootstrap.conf   Port 80, für certbot
-    nginx-whatsapp-transcribe.conf             Reverse Proxy + TLS + Limits
+    nginx-whisper-location.conf      location-Block → snippets/whisper.conf
+    nginx-whisper-limits.conf        Rate-Limit-Zonen → conf.d/
     update-whatsapp-transcribe.sh    Deploy nach ~/scripts/
 
 extension/

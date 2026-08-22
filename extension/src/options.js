@@ -42,10 +42,18 @@ function flash(text, kind = "") {
   if (text) setTimeout(() => { if (el.textContent === text) el.textContent = ""; }, 5000);
 }
 
-/** Aus einer Backend-URL das Muster machen, das chrome.permissions erwartet. */
+/**
+ * Aus einer Backend-URL das Muster machen, das chrome.permissions erwartet.
+ *
+ * Der Pfad kommt bewusst mit hinein: bei einer Backend-URL wie
+ * https://fherrmann.com/whisper waere ein Muster auf die blosse Origin eine
+ * Berechtigung fuer die gesamte Domain. So bleibt sie auf /whisper/ begrenzt.
+ */
 function originPattern(url) {
   try {
-    return new URL(url).origin + "/*";
+    const u = new URL(url);
+    if (u.protocol !== "https:" && u.protocol !== "http:") return null;
+    return u.origin + u.pathname.replace(/\/+$/, "") + "/*";
   } catch {
     return null;
   }
