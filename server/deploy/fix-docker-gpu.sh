@@ -7,71 +7,137 @@
 #   hook #0: fork/exec /snap/docker/3377/usr/bin/nvidia-ctk: no such file
 #
 # Ursache:
-#   Der Docker-Snap bringt das NVIDIA-Container-Toolkit selbst mit. Die
-#   CDI-Spezifikation unter /var/snap/docker/current/etc/cdi/nvidia.yaml wird
-#   einmalig erzeugt und enthaelt dabei den *revisionsgenauen* Snap-Pfad
-#   (z. B. /snap/docker/3377/...). Aktualisiert sich der Snap, zeigt die Spec
-#   ins Leere und jeder Containerstart mit --runtime=nvidia scheitert.
+#   Der Docker-Snap bringt das NVIDIA-Container-Toolkit selbst mit. Seine
+#   CDI-Spezifikation (/var/snap/docker/current/etc/cdi/nvidia.yaml) wird
+#   einmalig erzeugt und enthaelt dabei den *revisionsgenauen* Snap-Pfad zum
+#   Hook-Binary. Aktualisiert sich der Snap, zeigt dieser Pfad ins Leere und
+#   jeder Containerstart mit --runtime=nvidia scheitert.
 #
-# Was dieses Skript macht:
-#   1. Sicherung der bestehenden Spec
-#   2. Neu erzeugen
-#   3. Alle revisionsgenauen Pfade auf /snap/docker/current/ umschreiben —
-#      damit ueberlebt die Spec kuenftige Snap-Updates
-#   4. Gegentest mit einem Wegwerf-Container
+# Vorgehen:
+#   Die Spec wird NICHT neu erzeugt, sondern nur der Pfad korrigiert und auf
+#   den stabilen /snap/docker/current/-Symlink umgeschrieben — damit
+#   ueberlebt sie kuenftige Snap-Updates.
 #
-# Braucht Root. Der Docker-Daemon wird NICHT neu gestartet — CDI-Specs liest
-# die Runtime beim Containerstart von der Platte. Nur falls der Gegentest
-# scheitert, schlaegt das Skript einen Neustart vor (der wuerde alle
-# Container auf dem Host kurz mitnehmen).
+#   Neu erzeugen waere der Lehrbuchweg, aber `nvidia-ctk cdi generate` stuerzt
+#   auf diesem Toolkit-Stand beim Aufraeumen reproduzierbar ab
+#   ("free(): invalid pointer" in nvSandboxUtilsShutdown). Am Inhalt der Spec
+#   ist ohnehin nichts veraltet: alle referenzierten Treiberdateien existieren
+#   und die Treiberversion stimmt. Nur wenn beides nicht mehr zutrifft, hilft
+#   Umschreiben nicht — dann meldet das Skript das und bricht ab.
+#
+# --check prueft alles durch, ohne etwas zu veraendern (kein Root noetig).
 set -euo pipefail
 
-CTK=/snap/docker/current/usr/bin/nvidia-ctk
 CDI=/var/snap/docker/current/etc/cdi/nvidia.yaml
+SNAP_BIN=/snap/docker/current/usr/bin
 TEST_IMAGE=ubuntu:22.04
 
-[ "$(id -u)" -eq 0 ] || { echo "Bitte mit sudo ausfuehren." >&2; exit 1; }
-[ -x "$CTK" ] || { echo "FEHLER: $CTK fehlt. Ist der Docker-Snap installiert?" >&2; exit 1; }
-command -v nvidia-smi >/dev/null || { echo "FEHLER: kein NVIDIA-Treiber auf dem Host." >&2; exit 1; }
+CHECK=0
+case "${1:-}" in
+    --check|-n) CHECK=1 ;;
+    "")         ;;
+    *)          echo "Aufruf: $0 [--check]" >&2; exit 2 ;;
+esac
 
-echo "==> Treiber"
-nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
+if [ -t 1 ]; then
+    B=$(printf '\033[1m'); G=$(printf '\033[32m'); Y=$(printf '\033[33m')
+    R=$(printf '\033[31m'); N=$(printf '\033[0m')
+else B=""; G=""; Y=""; R=""; N=""; fi
+step() { echo; echo "${B}==> $*${N}"; }
+ok()   { echo "  ${G}OK${N}   $*"; }
+warn() { echo "  ${Y}!${N}    $*"; }
+die()  { echo "  ${R}FEHLER${N} $*" >&2; exit 1; }
 
-if [ -f "$CDI" ]; then
-    BACKUP="$CDI.bak.$(date +%Y%m%d-%H%M%S)"
-    cp -a "$CDI" "$BACKUP"
-    echo "==> Sicherung: $BACKUP"
-    echo "    bisher referenzierte Revisionen: $(grep -o '/snap/docker/[0-9]*' "$CDI" | sort -u | tr '\n' ' ')"
+[ "$CHECK" = 1 ] || [ "$(id -u)" -eq 0 ] || die "Bitte mit sudo ausfuehren (oder --check)."
+
+# ------------------------------------------------------------------ Befund
+
+step "Befund"
+
+command -v nvidia-smi >/dev/null || die "kein NVIDIA-Treiber auf dem Host."
+host_drv=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1 | tr -d '[:space:]')
+ok "Treiber $host_drv — $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | head -1)"
+
+[ -f "$CDI" ] || die "$CDI fehlt. Diese Reparatur setzt eine vorhandene Spec voraus."
+[ -x "$SNAP_BIN/nvidia-ctk" ] || die "$SNAP_BIN/nvidia-ctk fehlt. Docker-Snap installiert?"
+
+revs=$(grep -o '/snap/docker/[0-9]*' "$CDI" | sort -u | sed 's|.*/||' | tr '\n' ' ')
+cur=$(readlink /snap/docker/current)
+if [ -z "$revs" ]; then
+    ok "Spec enthaelt keine revisionsgenauen Pfade"
+else
+    warn "Spec zeigt auf Revision(en): ${revs}— aktuell ist $cur"
 fi
 
-echo "==> CDI-Spezifikation neu erzeugen"
+# Treiberversion in der Spec: steckt in den Dateinamen der Bibliotheken.
+spec_drv=$(grep -oE 'libnvidia-ml\.so\.[0-9]+\.[0-9.]+' "$CDI" | head -1 | sed 's/.*\.so\.//')
+if [ "$spec_drv" = "$host_drv" ]; then
+    ok "Treiberversion in der Spec passt ($spec_drv)"
+else
+    die "Spec nennt Treiber $spec_drv, installiert ist $host_drv.
+       Ein Pfad-Umschreiben reicht dann nicht — die Spec muss neu erzeugt werden:
+         sudo $SNAP_BIN/nvidia-ctk cdi generate --output=$CDI
+       Stuerzt das mit 'free(): invalid pointer' ab, ist das ein Bug im
+       mitgelieferten Toolkit; dann hilft nur ein Snap-Update abzuwarten."
+fi
+
+# Alle referenzierten Treiberdateien pruefen. In der Spec stehen sie mit dem
+# Praefix /var/lib/snapd/hostfs (die Sicht aus der Snap-Namespace) — vom Host
+# aus liegen sie unter dem Pfad ohne dieses Praefix.
+missing=0
+while read -r p; do
+    [ -e "${p#/var/lib/snapd/hostfs}" ] || { echo "       fehlt: ${p#/var/lib/snapd/hostfs}"; missing=$((missing+1)); }
+done < <(grep -oE '(hostPath|path): /var/lib/snapd/hostfs/[^ ]*' "$CDI" | awk '{print $2}' | sort -u)
+[ "$missing" -eq 0 ] && ok "alle referenzierten Treiberdateien vorhanden" \
+                     || die "$missing referenzierte Treiberdatei(en) fehlen — Spec neu erzeugen noetig."
+
+# --------------------------------------------------------------- Reparatur
+
+step "Reparatur vorbereiten"
+
 TMP=$(mktemp /tmp/nvidia-cdi.XXXXXX.yaml)
 trap 'rm -f "$TMP"' EXIT
-"$CTK" cdi generate --output="$TMP"
+sed 's#/snap/docker/[0-9][0-9]*/#/snap/docker/current/#g' "$CDI" > "$TMP"
 
-echo "==> revisionsgenaue Pfade auf den stabilen current-Symlink umschreiben"
-sed -i 's#/snap/docker/[0-9][0-9]*/#/snap/docker/current/#g' "$TMP"
+grep -q '/snap/docker/[0-9]' "$TMP" && die "es sind noch revisionsgenaue Pfade uebrig."
+ok "alle Snap-Pfade zeigen jetzt auf /snap/docker/current/"
 
-if grep -q '/snap/docker/[0-9]' "$TMP"; then
-    echo "FEHLER: es sind noch revisionsgenaue Pfade uebrig:" >&2
-    grep -n '/snap/docker/[0-9]' "$TMP" | head >&2
-    exit 1
+# Jedes referenzierte Snap-Binary muss existieren und ausfuehrbar sein.
+bad=0
+while read -r p; do
+    [ -x "$p" ] || { echo "       nicht ausfuehrbar: $p"; bad=$((bad+1)); }
+done < <(grep -oE '/snap/docker/current/[^ ]*' "$TMP" | sort -u)
+[ "$bad" -eq 0 ] && ok "alle referenzierten Snap-Binaries sind ausfuehrbar" \
+                 || die "$bad referenzierte(s) Binary nicht nutzbar."
+
+if ! diff -q "$CDI" "$TMP" >/dev/null; then
+    ok "$(diff "$CDI" "$TMP" | grep -c '^<') Zeile(n) werden geaendert"
+else
+    ok "Spec ist bereits korrekt — nichts zu tun"
 fi
 
-# Plausibilitaet: die Spec muss auf ein existierendes nvidia-ctk zeigen
-hook=$(grep -m1 -o '/snap/docker/current/usr/bin/nvidia-ctk' "$TMP" || true)
-[ -n "$hook" ] && [ -x "$hook" ] || {
-    echo "FEHLER: die erzeugte Spec verweist nicht auf ein ausfuehrbares nvidia-ctk." >&2
-    exit 1
-}
+if [ "$CHECK" = 1 ]; then
+    echo
+    echo "  --check: es wurde nichts veraendert. Ohne --check (und mit sudo)"
+    echo "  wuerde das Skript die Spec schreiben und gegentesten."
+    exit 0
+fi
 
-mkdir -p "$(dirname "$CDI")"
+# ------------------------------------------------------------------ Anwenden
+
+step "Anwenden"
+
+BACKUP="$CDI.bak.$(date +%Y%m%d-%H%M%S)"
+cp -a "$CDI" "$BACKUP"
+ok "Sicherung: $BACKUP"
+
 install -m 644 "$TMP" "$CDI"
-echo "==> $CDI geschrieben"
+ok "$CDI geschrieben"
 
-echo "==> Gegentest"
+step "Gegentest"
+
 if ! docker image inspect "$TEST_IMAGE" >/dev/null 2>&1; then
-    echo "    hole $TEST_IMAGE ..."
+    echo "  hole $TEST_IMAGE ..."
     docker pull -q "$TEST_IMAGE" >/dev/null
 fi
 
@@ -80,16 +146,21 @@ if out=$(docker run --rm --runtime=nvidia \
             -e NVIDIA_DRIVER_CAPABILITIES=compute,utility \
             "$TEST_IMAGE" nvidia-smi -L 2>&1); then
     echo
-    echo "    $out"
+    echo "  $out"
     echo
-    echo "==> GPU ist aus Containern nutzbar."
+    ok "GPU ist aus Containern nutzbar."
+    echo
+    echo "  Weiter mit: ~/scripts/setup-whatsapp-transcribe.sh"
     exit 0
 fi
 
 echo >&2
 echo "$out" >&2
 echo >&2
-echo "==> Gegentest fehlgeschlagen. Naechster Schritt waere ein Daemon-Neustart:" >&2
+warn "Gegentest fehlgeschlagen. Zuruecknehmen mit:"
+echo "      sudo cp -a $BACKUP $CDI" >&2
+echo >&2
+warn "Naechster Versuch waere ein Daemon-Neustart:"
 echo "      sudo snap restart docker" >&2
 echo "    ACHTUNG: das nimmt kurz alle Container auf diesem Host mit" >&2
 echo "    (Jellyfin, Spieleserver, firefly, wahlen ...)." >&2

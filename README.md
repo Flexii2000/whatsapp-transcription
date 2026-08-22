@@ -119,9 +119,22 @@ error running createContainer hook #0:
 fork/exec /snap/docker/3377/usr/bin/nvidia-ctk: no such file or directory
 ```
 
-Das Skript erzeugt die Spec neu und schreibt die Pfade auf den stabilen
+Das Skript schreibt die Pfade in der bestehenden Spec auf den stabilen
 `/snap/docker/current/`-Symlink um — damit übersteht sie künftige
 Snap-Updates. Der Docker-Daemon wird dabei **nicht** neu gestartet.
+
+Die Spec wird bewusst *nicht* neu erzeugt: `nvidia-ctk cdi generate` stürzt
+auf diesem Toolkit-Stand reproduzierbar beim Aufräumen ab
+(`free(): invalid pointer` in `nvSandboxUtilsShutdown`). Nötig ist es auch
+nicht — am Inhalt ist nichts veraltet, die Treiberversion stimmt und alle
+referenzierten Treiberdateien existieren. Genau das prüft das Skript vorher,
+und bricht ab, falls es doch mal nicht zutrifft.
+
+`--check` prüft alles durch, ohne etwas zu ändern, und braucht kein Root:
+
+```bash
+~/scripts/fix-docker-gpu.sh --check
+```
 
 **VRAM-Rechnung** für die 6 GB der Karte:
 
