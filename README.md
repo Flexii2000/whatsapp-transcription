@@ -72,22 +72,38 @@ Der erste Start lädt das Whisper-Modell herunter (`large-v3-turbo`, ~1,6 GB)
 — das dauert einige Minuten. Das Skript wartet darauf und zeigt am Ende die
 `/health`-Antwort.
 
-### nginx + TLS
+### nginx + TLS — Reihenfolge beachten
 
-Braucht Root, also selbst am Terminal:
+Braucht Root, also selbst am Terminal. **Zwei Stufen**, und die Reihenfolge
+ist nicht optional: die Vollversion verweist auf Zertifikatsdateien, die es
+vorher noch nicht gibt, und lässt `nginx -t` sonst fehlschlagen. Umgekehrt
+braucht certbot einen Port-80-Block für diesen Hostnamen — ohne den bekommt
+die HTTP-01-Challenge auf diesem Server keine Antwort.
 
 ```bash
+# Stufe 1: nur Port 80, damit certbot durchkommt
+sudo cp deploy/nginx-whatsapp-transcribe-bootstrap.conf \
+        /etc/nginx/sites-available/whatsapp-transcribe
+sudo ln -s /etc/nginx/sites-available/whatsapp-transcribe /etc/nginx/sites-enabled/
+sudo nginx -t && sudo systemctl reload nginx
+
+# Zertifikat holen
+sudo certbot certonly --webroot -w /var/www/html -d whisper.fherrmann.com
+
+# Stufe 2: Vollversion mit TLS, Timeouts und Rate-Limits
 sudo cp deploy/nginx-whatsapp-transcribe.conf \
         /etc/nginx/sites-available/whatsapp-transcribe
-sudo ln -s /etc/nginx/sites-available/whatsapp-transcribe \
-           /etc/nginx/sites-enabled/
-sudo certbot --nginx -d whisper.fherrmann.com
 sudo nginx -t && sudo systemctl reload nginx
 ```
 
-Die beiden Jellyfin-Configs fangen mit `server_name _;` unbekannte Hostnamen
-ab — hier unkritisch, weil nginx den exakten `server_name`-Treffer immer
-bevorzugt.
+Zwei Eigenheiten dieses Servers, beide verifiziert:
+
+- Die Jellyfin-Configs fangen mit `server_name _;` unbekannte Hostnamen ab.
+  Ohne eigenen Block landet `whisper.fherrmann.com` dort und liefert ein
+  **falsches Zertifikat** aus. Mit eigenem Block unkritisch — nginx bevorzugt
+  den exakten `server_name`-Treffer immer vor dem Default-Server.
+- Auf Port 80 antwortet für unbekannte Hostnamen gar nichts (`Empty reply`),
+  während `fherrmann.com` sauber 301 liefert. Genau deshalb Stufe 1 zuerst.
 
 ### Nach dem Deploy: `SERVER-CONTEXT.md` nachziehen
 
@@ -162,6 +178,8 @@ sieht das blaue Mikrofon. Deshalb ist er standardmäßig aus.
 | `SUMMARY_MAX_BULLETS` | `5` | Obergrenze der Stichpunkte |
 | `SUMMARY_EFFORT` | `low` | `low`/`medium`/`high` — für eine Zusammenfassung reicht `low` |
 | `MAX_CONCURRENCY` | `1` | Parallele Transkriptionen auf dem Server |
+| `CACHE_TTL_DAYS` | `0` | Tage bis zum automatischen Löschen der Transkripte. `0` = unbegrenzt |
+| `CORS_ORIGINS` | leer | Leer lassen — die Extension braucht kein CORS |
 
 Claude läuft mit `fallbacks: "default"` (Beta `server-side-fallback-2026-07-01`):
 lehnt ein Sicherheitsklassifikator eine Anfrage ab, wiederholt die API sie
@@ -176,6 +194,70 @@ dieselbe Nachricht nie zweimal bezahlt wird.
 
 > Ein claude.ai-Abo ist **kein** API-Zugang — API-Nutzung wird separat
 > abgerechnet.
+
+---
+
+## Datenschutz & Sicherheit
+
+### Wo die Daten liegen
+
+| Was | Wohin | Wie lange |
+|---|---|---|
+| Audio | Nur in den Arbeitsspeicher des Containers. `faster-whisper` bekommt ein `BytesIO`, **keine Datei** | Bis der Request durch ist |
+| Transkript + Stichpunkte | SQLite auf dem Heimserver (`data/cache.sqlite3`) | `CACHE_TTL_DAYS`, Standard unbegrenzt |
+| Transkript + Stichpunkte | `chrome.storage.local` im Browser, max. 500 Einträge | Bis „Lokalen Cache leeren“ |
+| **Transkript-Text** | **Anthropic-API**, für die Zusammenfassung | Nach deren API-Bedingungen |
+| Audio | geht **nie** an Anthropic oder sonst irgendwohin | — |
+
+Whisper läuft komplett lokal. Die einzige Übertragung nach außen ist der
+fertige **Text** an Claude — und die schaltest du mit `SUMMARY_ENABLED=false`
+komplett ab, dann verlässt gar nichts den Server.
+
+Nicht protokolliert werden: Transkript-Inhalte und die WhatsApp-`message_id`
+(die enthält die Telefonnummer des Chatpartners). In den Logs stehen nur die
+ersten 12 Zeichen des Audio-Hashes, Dauer, Wort- und Stichpunktzahl.
+
+### Wie der Endpunkt geschützt ist
+
+- **Bearer-Token**, verglichen mit `hmac.compare_digest` (laufzeitkonstant,
+  nicht über Antwortzeiten erratbar).
+- Die Prüfung läuft als ASGI-Middleware, **bevor der Body gelesen wird** —
+  ein Unbefugter kann den Server nicht zwingen, erst 40 MB entgegenzunehmen
+  und dann 401 zu antworten.
+- Der Container lauscht auf `127.0.0.1:8099`, ist also nur über nginx
+  erreichbar. TLS via Let's Encrypt.
+- **Rate-Limit** in nginx: 30 Anfragen/Minute pro IP, Burst 10, max. 4
+  gleichzeitige Verbindungen. Deckelt, was ein geleakter Token kosten kann.
+- Ohne gesetztes `AUTH_TOKEN` **startet der Dienst nicht** — er kann nicht
+  versehentlich offen im Netz stehen.
+- Größenlimits doppelt: `client_max_body_size 48m` in nginx,
+  `MAX_AUDIO_BYTES` in der App.
+- `MAX_CONCURRENCY=1` serialisiert die Transkription — der natürliche
+  Flaschenhals begrenzt zusätzlich, wie schnell Kosten entstehen können.
+
+Der Cache-Schlüssel ist `sha256` der Audiodatei. Fremde Transkripte lassen
+sich damit nicht erraten oder aufzählen: ohne die exakten Audiobytes gibt es
+keinen Treffer, und es gibt keinen Endpunkt, der den Cache auflistet.
+
+### Wenn du das an andere weitergibst
+
+Davon würde ich in dieser Form abraten — nicht wegen der Technik, sondern
+wegen der Rolle, in die dich das bringt:
+
+- Fremde Sprachnachrichten landen auf **deinem** Server. Damit verarbeitest
+  du personenbezogene Daten von Leuten, die davon nichts wissen — nämlich der
+  **Absender** der Memos, nicht nur der Nutzer der Extension. Solange das rein
+  privat läuft, greift die Haushaltsausnahme der DSGVO (Art. 2 Abs. 2 lit. c);
+  sobald du es verteilst, greift sie nicht mehr.
+- Sprachnachrichten enthalten oft besondere Kategorien nach Art. 9 (Gesundheit,
+  Beziehungen) — dafür gelten strengere Anforderungen.
+- Technisch fehlt dafür alles Nötige: **ein** gemeinsamer Token statt Konten,
+  keine Mandantentrennung, kein Löschweg für Betroffene, keine
+  Aufbewahrungsfrist im Standard.
+
+Für den privaten Eigengebrauch ist der aktuelle Stand angemessen. Für mehr
+als das bräuchte es Tokens pro Nutzer, `CACHE_TTL_DAYS`, einen Löschendpunkt
+und eine Datenschutzerklärung.
 
 ---
 
@@ -237,7 +319,8 @@ server/
   Dockerfile, docker-compose.yml     Container (Port 127.0.0.1:8099)
   .env.example                       Konfigurationsvorlage
   deploy/
-    nginx-whatsapp-transcribe.conf   Reverse Proxy + TLS
+    nginx-whatsapp-transcribe-bootstrap.conf   Port 80, für certbot
+    nginx-whatsapp-transcribe.conf             Reverse Proxy + TLS + Limits
     update-whatsapp-transcribe.sh    Deploy nach ~/scripts/
 
 extension/

@@ -5,6 +5,13 @@ Nimmt eine Sprachnachricht (base64) entgegen, transkribiert sie lokal mit
 faster-whisper und laesst Claude daraus eine Executive Summary in
 Stichpunkten bauen. Der Anthropic-API-Key liegt ausschliesslich hier,
 nie in der Browser-Extension.
+
+Datenhaltung, bewusst knapp gehalten:
+  - Audio wird nur im Arbeitsspeicher verarbeitet und nie gespeichert.
+  - Persistiert werden ausschliesslich sha256(Audio), Transkript und
+    Stichpunkte — optional mit Verfallsdatum (CACHE_TTL_DAYS).
+  - Es wird nichts protokolliert, woraus sich Absender oder Inhalt
+    rekonstruieren lassen.
 """
 
 from __future__ import annotations
@@ -13,11 +20,12 @@ import asyncio
 import base64
 import binascii
 import hashlib
+import hmac
+import io
 import json
 import logging
 import os
 import sqlite3
-import tempfile
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -25,9 +33,10 @@ from pathlib import Path
 from typing import Any, Literal
 
 import anthropic
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from starlette.responses import JSONResponse
 
 log = logging.getLogger("wat")
 logging.basicConfig(
@@ -58,7 +67,14 @@ SUMMARY_MAX_BULLETS = int(os.getenv("SUMMARY_MAX_BULLETS", "5"))
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
 CACHE_DB = DATA_DIR / "cache.sqlite3"
-CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "*").split(",") if o.strip()]
+# 0 = unbegrenzt aufheben. Sonst werden aeltere Eintraege beim Start und
+# nach jedem Schreibvorgang geloescht.
+CACHE_TTL_DAYS = int(os.getenv("CACHE_TTL_DAYS", "0"))
+
+# Leer = CORS-Middleware gar nicht erst einhaengen. Die Extension ruft aus
+# ihrem Service-Worker heraus auf und braucht kein CORS; ein offenes "*"
+# waere nur unnoetige Angriffsflaeche.
+CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
 
 SYSTEM_PROMPT = """\
 Du fasst transkribierte WhatsApp-Sprachnachrichten fuer den Empfaenger zusammen.
@@ -108,8 +124,20 @@ def _db_init() -> sqlite3.Connection:
                created_at  REAL NOT NULL
            )"""
     )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_created ON transcripts(created_at)")
     conn.commit()
     return conn
+
+
+def cache_purge() -> int:
+    """Loescht abgelaufene Eintraege. Ohne TTL passiert nichts."""
+    if CACHE_TTL_DAYS <= 0 or _db is None:
+        return 0
+    cutoff = time.time() - CACHE_TTL_DAYS * 86400
+    with _db_lock:
+        cur = _db.execute("DELETE FROM transcripts WHERE created_at < ?", (cutoff,))
+        _db.commit()
+    return cur.rowcount or 0
 
 
 def cache_get(sha: str) -> dict[str, Any] | None:
@@ -144,6 +172,7 @@ def cache_put(sha: str, payload: dict[str, Any]) -> None:
             ),
         )
         _db.commit()
+    cache_purge()
 
 
 # --------------------------------------------------------------------------
@@ -151,7 +180,7 @@ def cache_put(sha: str, payload: dict[str, Any]) -> None:
 # --------------------------------------------------------------------------
 
 _model: Any = None
-_gpu_sema = asyncio.Semaphore(MAX_CONCURRENCY)
+_slots = asyncio.Semaphore(MAX_CONCURRENCY)
 
 
 def _load_model() -> Any:
@@ -167,10 +196,12 @@ def _load_model() -> Any:
     return m
 
 
-def _transcribe_sync(path: str, language: str | None) -> tuple[str, str | None, float]:
+def _transcribe_sync(audio: bytes, language: str | None) -> tuple[str, str | None, float]:
+    """faster-whisper nimmt ein file-like object entgegen. Die Sprachnachricht
+    bleibt damit im Arbeitsspeicher und landet nie auf der Platte."""
     assert _model is not None
     segments, info = _model.transcribe(
-        path,
+        io.BytesIO(audio),
         language=language,
         beam_size=WHISPER_BEAM_SIZE,
         vad_filter=True,
@@ -194,18 +225,17 @@ def _summary_available() -> bool:
 
 
 def _summarize_sync(transcript: str) -> list[str]:
-    """Gibt Stichpunkte zurueck. Bei jedem Problem: leere Liste, nie eine Exception
-    nach oben — ein fehlendes Summary darf das Transkript nicht kaputt machen."""
+    """Gibt Stichpunkte zurueck. Bei jedem Problem: leere Liste, nie eine
+    Exception nach oben — ein fehlendes Summary darf das Transkript nicht
+    kaputt machen."""
     assert _anthropic is not None
-    min_b = 1
-    max_b = SUMMARY_MAX_BULLETS
     try:
         resp = _anthropic.beta.messages.create(
             model=SUMMARY_MODEL,
             max_tokens=2000,
             betas=["server-side-fallback-2026-07-01"],
             fallbacks="default",
-            system=SYSTEM_PROMPT.format(min_b=min_b, max_b=max_b),
+            system=SYSTEM_PROMPT.format(min_b=1, max_b=SUMMARY_MAX_BULLETS),
             output_config={
                 "effort": SUMMARY_EFFORT,
                 "format": {"type": "json_schema", "schema": SUMMARY_SCHEMA},
@@ -238,6 +268,53 @@ def _summarize_sync(transcript: str) -> list[str]:
 
 
 # --------------------------------------------------------------------------
+# Zugangsschutz
+# --------------------------------------------------------------------------
+
+PROTECTED_PREFIXES = ("/transcribe",)
+# base64 blaeht um 4/3 auf, dazu etwas JSON-Rahmen.
+MAX_BODY_BYTES = MAX_AUDIO_BYTES * 4 // 3 + 4096
+
+
+class BearerAuthMiddleware:
+    """Prueft Token und Groesse, *bevor* der Request-Body gelesen wird.
+
+    Als Dependency im Endpunkt waere der Body zum Pruefzeitpunkt laengst
+    eingelesen — ein unauthentifizierter Aufrufer koennte den Server also
+    zwingen, zig Megabyte entgegenzunehmen, nur um dann 401 zu bekommen.
+    """
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+        self.expected = f"Bearer {AUTH_TOKEN}"
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] != "http" or not scope["path"].startswith(PROTECTED_PREFIXES):
+            return await self.app(scope, receive, send)
+
+        headers = {k.lower(): v for k, v in scope.get("headers", [])}
+
+        given = headers.get(b"authorization", b"").decode("latin-1").strip()
+        if not hmac.compare_digest(given, self.expected):
+            log.warning("Abgelehnt: ungueltiger Token von %s", _client_of(scope))
+            return await JSONResponse({"detail": "Ungueltiger Token."}, 401)(scope, receive, send)
+
+        try:
+            length = int(headers.get(b"content-length", b"0"))
+        except ValueError:
+            length = 0
+        if length > MAX_BODY_BYTES:
+            return await JSONResponse({"detail": "Anfrage zu gross."}, 413)(scope, receive, send)
+
+        await self.app(scope, receive, send)
+
+
+def _client_of(scope: Any) -> str:
+    client = scope.get("client")
+    return client[0] if client else "?"
+
+
+# --------------------------------------------------------------------------
 # App
 # --------------------------------------------------------------------------
 
@@ -245,6 +322,8 @@ def _summarize_sync(transcript: str) -> list[str]:
 async def lifespan(app: FastAPI):
     global _db, _model, _anthropic
     _db = _db_init()
+    if (purged := cache_purge()):
+        log.info("Cache: %d abgelaufene Eintraege entfernt", purged)
 
     key = os.getenv("ANTHROPIC_API_KEY", "").strip()
     if SUMMARY_ENABLED and key:
@@ -259,29 +338,30 @@ async def lifespan(app: FastAPI):
         _db.close()
 
 
-app = FastAPI(title="WhatsApp Voice Transcribe", version="1.0.0", lifespan=lifespan)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=CORS_ORIGINS,
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+if not AUTH_TOKEN:
+    # Lieber gar nicht starten als offen im Netz stehen.
+    raise RuntimeError("AUTH_TOKEN ist nicht gesetzt — Start abgebrochen.")
+if len(AUTH_TOKEN) < 20:
+    log.warning("AUTH_TOKEN ist kurz. Empfohlen: openssl rand -hex 32")
 
-
-def require_token(authorization: str = Header(default="")) -> None:
-    if not AUTH_TOKEN:
-        raise HTTPException(500, "AUTH_TOKEN ist auf dem Server nicht gesetzt.")
-    expected = f"Bearer {AUTH_TOKEN}"
-    # constant-time, damit der Token nicht ueber Antwortzeiten erratbar ist
-    import hmac
-    if not hmac.compare_digest(authorization.strip(), expected):
-        raise HTTPException(401, "Ungueltiger Token.")
+app = FastAPI(title="WhatsApp Voice Transcribe", version="1.1.0", lifespan=lifespan)
+app.add_middleware(BearerAuthMiddleware)
+if CORS_ORIGINS:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=CORS_ORIGINS,
+        allow_credentials=False,
+        allow_methods=["POST", "GET"],
+        allow_headers=["Authorization", "Content-Type"],
+    )
 
 
 class TranscribeRequest(BaseModel):
     audio_b64: str = Field(..., description="Rohe Audiodatei, base64-kodiert")
     mime: str = "audio/ogg"
+    # Wird entgegengenommen, damit die Extension ihre Anfragen zuordnen kann,
+    # aber bewusst nirgends gespeichert oder protokolliert: die WhatsApp-ID
+    # enthaelt die Telefonnummer des Chatpartners.
     message_id: str | None = None
     language: str | None = Field(default=None, description="ISO-639-1, None = auto")
 
@@ -303,11 +383,15 @@ async def health() -> dict[str, Any]:
         "device": WHISPER_DEVICE,
         "summary": _summary_available(),
         "summary_model": SUMMARY_MODEL if _summary_available() else None,
+        "cache_ttl_days": CACHE_TTL_DAYS or None,
     }
 
 
-@app.post("/transcribe", response_model=TranscribeResponse, dependencies=[Depends(require_token)])
+@app.post("/transcribe", response_model=TranscribeResponse)
 async def transcribe(req: TranscribeRequest) -> TranscribeResponse:
+    if len(req.audio_b64) > MAX_BODY_BYTES:
+        raise HTTPException(413, "Audio zu gross.")
+
     try:
         audio = base64.b64decode(req.audio_b64, validate=True)
     except (binascii.Error, ValueError):
@@ -320,24 +404,18 @@ async def transcribe(req: TranscribeRequest) -> TranscribeResponse:
 
     sha = hashlib.sha256(audio).hexdigest()
     if (hit := cache_get(sha)) is not None:
-        log.info("cache hit  %s  (%s)", sha[:12], req.message_id or "-")
+        log.info("cache hit  %s", sha[:12])
         return TranscribeResponse(**hit, cached=True)
 
-    suffix = {"audio/ogg": ".ogg", "audio/mpeg": ".mp3", "audio/mp4": ".m4a",
-              "audio/aac": ".aac", "audio/wav": ".wav", "audio/webm": ".webm"}.get(req.mime, ".ogg")
-
-    async with _gpu_sema:
+    async with _slots:
         t0 = time.time()
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=True) as tmp:
-            tmp.write(audio)
-            tmp.flush()
-            try:
-                transcript, lang, duration = await asyncio.to_thread(
-                    _transcribe_sync, tmp.name, req.language or WHISPER_LANGUAGE
-                )
-            except Exception as exc:  # noqa: BLE001 — Decoder-Fehler sind vielfaeltig
-                log.exception("Transkription fehlgeschlagen")
-                raise HTTPException(422, f"Transkription fehlgeschlagen: {exc}") from exc
+        try:
+            transcript, lang, duration = await asyncio.to_thread(
+                _transcribe_sync, audio, req.language or WHISPER_LANGUAGE
+            )
+        except Exception as exc:  # noqa: BLE001 — Decoder-Fehler sind vielfaeltig
+            log.exception("Transkription fehlgeschlagen")
+            raise HTTPException(422, f"Transkription fehlgeschlagen: {exc}") from exc
         whisper_sec = time.time() - t0
 
     if not transcript:
@@ -350,6 +428,7 @@ async def transcribe(req: TranscribeRequest) -> TranscribeResponse:
         except Exception:  # noqa: BLE001
             log.exception("Summary-Schritt uebersprungen")
 
+    # Bewusst ohne Transkript-Inhalt und ohne message_id im Log.
     log.info(
         "transkribiert %s  %.1fs Audio  %.1fs Whisper  %d Woerter  %d Stichpunkte",
         sha[:12], duration, whisper_sec, len(transcript.split()), len(summary),
