@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sprachmemo-Transkription — Einstellungen</title>
+  <link rel="stylesheet" href="options.css">
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Sprachmemo-Transkription</h1>
+      <p class="sub">
+        Empfangene WhatsApp-Sprachnachrichten werden auf deinem Heimserver
+        transkribiert und von Claude in Stichpunkte gefasst.
+      </p>
+    </header>
+
+    <section>
+      <h2>Backend</h2>
+
+      <label for="backendUrl">Adresse</label>
+      <input id="backendUrl" type="url" placeholder="https://whisper.fherrmann.com" spellcheck="false" autocomplete="off">
+      <p class="hint">Ohne Pfad am Ende. Muss per HTTPS erreichbar sein.</p>
+
+      <label for="authToken">Token</label>
+      <input id="authToken" type="password" placeholder="AUTH_TOKEN aus der .env des Servers" spellcheck="false" autocomplete="off">
+      <p class="hint">
+        Muss exakt dem <code>AUTH_TOKEN</code> in der <code>.env</code> auf dem
+        Server entsprechen. Der Anthropic-Key gehört <em>nicht</em> hierher —
+        der bleibt auf dem Server.
+      </p>
+
+      <div class="row">
+        <button id="grant" type="button" class="secondary">Zugriff erlauben</button>
+        <button id="test" type="button" class="secondary">Verbindung testen</button>
+      </div>
+      <p id="perm" class="hint"></p>
+      <pre id="testOut" hidden></pre>
+    </section>
+
+    <section>
+      <h2>Verhalten</h2>
+
+      <label class="check">
+        <input id="autoTranscribe" type="checkbox">
+        <span>
+          <strong>Automatisch transkribieren</strong>
+          <em>Sichtbare Sprachnachrichten werden ohne Zutun verarbeitet. Ist das aus, erscheint pro Nachricht ein Knopf.</em>
+        </span>
+      </label>
+
+      <label class="check">
+        <input id="expandFullByDefault" type="checkbox">
+        <span>
+          <strong>Volltext sofort ausklappen</strong>
+          <em>Standardmäßig stehen nur die Stichpunkte da, der Volltext liegt hinter „Volltext“.</em>
+        </span>
+      </label>
+
+      <label class="check warn">
+        <input id="autoForcePlay" type="checkbox">
+        <span>
+          <strong>Noch nicht geladene Memos automatisch nachladen</strong>
+          <em>
+            Erzwingt WhatsApps Media-Download über einen stummen Play/Pause-Klick.
+            <b>Damit sieht der Absender die Nachricht als abgehört</b> (blaues Mikrofon).
+            Aus gutem Grund standardmäßig aus — ohne diesen Schalter bekommst du
+            stattdessen einen Knopf pro Nachricht.
+          </em>
+        </span>
+      </label>
+
+      <label for="maxParallel">Parallele Anfragen</label>
+      <input id="maxParallel" type="number" min="1" max="6" step="1">
+      <p class="hint">Höher lohnt nur, wenn der Server mehrere Transkriptionen gleichzeitig verkraftet.</p>
+
+      <label class="check">
+        <input id="debug" type="checkbox">
+        <span>
+          <strong>Debug-Ausgaben</strong>
+          <em>Schreibt Diagnosen in die Konsole von web.whatsapp.com.</em>
+        </span>
+      </label>
+    </section>
+
+    <section>
+      <h2>Zwischenspeicher</h2>
+      <p class="hint">
+        Fertige Transkripte liegen lokal, damit dieselbe Nachricht nie zweimal
+        verarbeitet wird. Der Server hält zusätzlich einen eigenen Cache.
+      </p>
+      <button id="clearCache" type="button" class="secondary">Lokalen Cache leeren</button>
+    </section>
+
+    <footer>
+      <button id="save" type="button" class="primary">Speichern</button>
+      <span id="status" role="status"></span>
+    </footer>
+  </main>
+
+  <script src="options.js"></script>
+</body>
+</html>

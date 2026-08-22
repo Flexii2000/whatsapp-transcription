@@ -1,0 +1,215 @@
+/*
+ * Das Panel soll wie ein Teil der Nachrichtenblase wirken, nicht wie eine
+ * aufgesetzte Karte: nur eine Haarlinie als Trenner, kein eigener Hintergrund,
+ * kein Rahmen, kein Schatten.
+ *
+ * Farben kommen bevorzugt aus WhatsApps eigenen CSS-Variablen — damit folgt
+ * das Panel dem Theme automatisch. Die Fallbacks greifen nur, falls WhatsApp
+ * die Variablen umbenennt.
+ */
+
+.wat {
+  --wat-text: var(--primary, #111b21);
+  --wat-muted: var(--secondary, #667781);
+  --wat-accent: var(--teal-light, #008069);
+  --wat-rule: rgba(134, 150, 160, 0.3);
+
+  box-sizing: border-box;
+  max-width: 100%;
+  min-width: 0;
+  margin: 6px 0 0;
+  padding: 6px 0 0;
+  border-top: 1px solid var(--wat-rule);
+
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--wat-text);
+  text-align: left;
+  white-space: normal;
+  user-select: text;
+  cursor: auto;
+  position: relative;
+  z-index: 1;
+}
+
+/* WhatsApp setzt die Theme-Klasse je nach Build auf <html> oder <body>. */
+html.dark .wat,
+body.dark .wat {
+  --wat-text: var(--primary, #e9edef);
+  --wat-muted: var(--secondary, #8696a0);
+  --wat-accent: var(--teal-light, #00a884);
+  --wat-rule: rgba(134, 150, 160, 0.22);
+}
+
+.wat * {
+  box-sizing: border-box;
+}
+
+/* ------------------------------------------------------------ Kopfzeile */
+
+.wat__head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 3px;
+}
+
+.wat__label {
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--wat-muted);
+  flex: 0 1 auto;
+  min-width: 0;
+}
+
+.wat__spacer {
+  flex: 1 1 auto;
+}
+
+.wat__toggle {
+  flex: 0 0 auto;
+  appearance: none;
+  background: none;
+  border: 0;
+  padding: 0;
+  margin: 0;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--wat-accent);
+  cursor: pointer;
+  white-space: nowrap;
+  opacity: 0.85;
+}
+
+.wat__toggle:hover {
+  opacity: 1;
+  text-decoration: underline;
+}
+
+.wat__toggle--action {
+  text-decoration: underline;
+}
+
+/* ----------------------------------------------------------- Stichpunkte */
+
+.wat__bullets {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.wat__bullets:empty {
+  display: none;
+}
+
+.wat__bullets li {
+  position: relative;
+  padding-left: 15px;
+  margin: 0 0 2px;
+  overflow-wrap: anywhere;
+}
+
+.wat__bullets li::before {
+  content: "";
+  position: absolute;
+  left: 4px;
+  top: 0.62em;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--wat-accent);
+  opacity: 0.75;
+}
+
+/* Zeilen, die eine Handlung vom Empfaenger verlangen ("Bis Freitag
+   antworten"), bekommen einen Pfeil statt des Punkts. Das Content-Script
+   entfernt dafuer das "-> " aus dem Modelltext. */
+.wat__bullets li.wat__action {
+  font-weight: 500;
+  padding-left: 15px;
+}
+
+.wat__bullets li.wat__action::before {
+  content: "→";
+  background: none;
+  border-radius: 0;
+  width: auto;
+  height: auto;
+  top: 0;
+  left: 0;
+  color: var(--wat-accent);
+  opacity: 1;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+/* -------------------------------------------------------------- Volltext */
+
+.wat__full {
+  color: var(--wat-muted);
+  font-size: 12.5px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.wat__full:empty {
+  display: none;
+}
+
+.wat__bullets:not(:empty) + .wat__full:not(:empty) {
+  margin-top: 5px;
+  padding-top: 5px;
+  border-top: 1px dashed var(--wat-rule);
+}
+
+/* -------------------------------------------------------------- Zustaende */
+
+.wat[data-wat-state="pending"] .wat__label {
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 12px;
+}
+
+.wat[data-wat-state="pending"] .wat__label::after {
+  content: "…";
+  display: inline-block;
+  width: 1em;
+  text-align: left;
+  animation: wat-dots 1.2s steps(4, end) infinite;
+}
+
+@keyframes wat-dots {
+  0%   { content: "";    }
+  25%  { content: ".";   }
+  50%  { content: "..";  }
+  75%  { content: "..."; }
+}
+
+.wat--busy {
+  opacity: 0.75;
+}
+
+.wat[data-wat-state="error"] .wat__label,
+.wat[data-wat-state="needs-play"] .wat__label {
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.wat[data-wat-state="error"] .wat__label {
+  color: #e05c4a;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .wat[data-wat-state="pending"] .wat__label::after {
+    animation: none;
+    content: "…";
+  }
+}

@@ -1,0 +1,18 @@
+services:
+  whatsapp-transcribe:
+    build: .
+    container_name: whatsapp-transcribe
+    restart: unless-stopped
+    # Nur an localhost binden — nach aussen geht es ausschliesslich ueber nginx+TLS.
+    ports:
+      - "127.0.0.1:8099:8000"
+    env_file: .env
+    volumes:
+      - ./data:/data
+      - ./models:/models
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5).status == 200 else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 300s
