@@ -298,6 +298,38 @@ Nachricht nie zweimal bezahlt wird.
 
 ---
 
+## Statusboard
+
+`status.fherrmann.com` zeigt eine Karte für den Dienst. Sie liest **direkt**
+`https://fherrmann.com/whisper/stats` — kein Cron-Sammler dazwischen, gleiches
+Muster wie die Sonntagsfrage-Karte. Ein erfolgreicher Abruf belegt damit
+gleich mehreres: die Antwort enthält Zahlen aus der SQLite und den
+Ladezustand beider Modelle.
+
+Angezeigt werden Engine und Gerät (`large-v3-turbo · GPU (float16)`), das
+Zusammenfassungs-Backend (`qwen3:4b · lokal`), der Durchsatz als Vielfaches
+der Echtzeit, und wie viel insgesamt verarbeitet wurde.
+
+Zwei bewusste Abweichungen von den übrigen Karten:
+
+- **Keine Veraltet-Prüfung.** Der Dienst läuft nicht nach Zeitplan, sondern
+  nur wenn eine Sprachnachricht eintrifft. Drei stille Tage sind normal.
+  Der Zustand ergibt sich stattdessen aus Erreichbarkeit und Modell-Bereitschaft.
+- **Keine Zeitstempel einzelner Nachrichten.** `/stats` liefert nur Summen und
+  Mittelwerte. Die Seite ist öffentlich, und wann jemand Sprachnachrichten
+  bekommt, gehört nicht dorthin. Aus demselben Grund filtert `/stats` die
+  Modell-Liste des lokalen Ollama heraus, die in dessen `health()` steht.
+
+`/stats` ist als einziger Endpunkt **ohne Token** erreichbar — es steht nur
+drin, was ohnehin öffentlich angezeigt wird. `CORS_ORIGINS` steuert, wer es
+im Browser lesen darf; leer bedeutet `https://status.fherrmann.com`, `none`
+schaltet CORS ab.
+
+Die Karte selbst liegt im Statusboard-Repo
+(`~/Server-Projects/statusboard`, `web/index.html` + `web/app.js`).
+
+---
+
 ## Datenschutz & Sicherheit
 
 ### Wo die Daten liegen

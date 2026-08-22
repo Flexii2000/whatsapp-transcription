@@ -69,10 +69,19 @@ CACHE_DB = DATA_DIR / "cache.sqlite3"
 # nach jedem Schreibvorgang geloescht.
 CACHE_TTL_DAYS = int(os.getenv("CACHE_TTL_DAYS", "0"))
 
-# Leer = CORS-Middleware gar nicht erst einhaengen. Die Extension ruft aus
-# ihrem Service-Worker heraus auf und braucht kein CORS; ein offenes "*"
-# waere nur unnoetige Angriffsflaeche.
-CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
+# Die Extension ruft aus ihrem Service-Worker auf und braucht kein CORS.
+# Noetig ist es nur fuer das Statusboard, das /stats direkt im Browser holt.
+#
+# Nicht gesetzt oder leer bedeutet hier deshalb *Standard*, nicht *aus* — sonst
+# haetten bereits angelegte .env-Dateien mit leerem CORS_ORIGINS die Karte
+# stillschweigend lahmgelegt. Abschalten geht ausdruecklich mit "none".
+CORS_DEFAULT = "https://status.fherrmann.com"
+_cors_raw = os.getenv("CORS_ORIGINS", "").strip() or CORS_DEFAULT
+CORS_ORIGINS = (
+    []
+    if _cors_raw.lower() in ("none", "off", "-")
+    else [o.strip() for o in _cors_raw.split(",") if o.strip()]
+)
 
 # --------------------------------------------------------------------------
 # Cache (SQLite, Key = sha256 der Audiobytes)
@@ -96,6 +105,13 @@ def _db_init() -> sqlite3.Connection:
            )"""
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_created ON transcripts(created_at)")
+
+    # Migration: whisper_sec kam spaeter dazu (fuer die Tempo-Kennzahl).
+    # Altbestand bleibt NULL und faellt aus der Statistik heraus.
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(transcripts)")}
+    if "whisper_sec" not in cols:
+        conn.execute("ALTER TABLE transcripts ADD COLUMN whisper_sec REAL")
+
     conn.commit()
     return conn
 
@@ -128,11 +144,15 @@ def cache_get(sha: str) -> dict[str, Any] | None:
     }
 
 
-def cache_put(sha: str, payload: dict[str, Any]) -> None:
+def cache_put(sha: str, payload: dict[str, Any], whisper_sec: float | None = None) -> None:
     assert _db is not None
     with _db_lock:
+        # Spalten ausgeschrieben: die Tabelle hat schon einmal eine dazubekommen,
+        # und ein positionsbasiertes INSERT haette das stillschweigend verdreht.
         _db.execute(
-            "INSERT OR REPLACE INTO transcripts VALUES (?,?,?,?,?,?)",
+            """INSERT OR REPLACE INTO transcripts
+                   (sha256, transcript, summary, language, duration, created_at, whisper_sec)
+               VALUES (?,?,?,?,?,?,?)""",
             (
                 sha,
                 payload["transcript"],
@@ -140,10 +160,38 @@ def cache_put(sha: str, payload: dict[str, Any]) -> None:
                 payload.get("language"),
                 payload.get("duration_sec"),
                 time.time(),
+                whisper_sec,
             ),
         )
         _db.commit()
     cache_purge()
+
+
+def cache_stats() -> dict[str, Any]:
+    """Aggregat fuer das Statusboard.
+
+    Bewusst nur Summen und Mittel — keine Zeitstempel einzelner Nachrichten.
+    Das Statusboard ist oeffentlich, und wann jemand Sprachnachrichten bekommt,
+    geht niemanden etwas an.
+    """
+    assert _db is not None
+    with _db_lock:
+        count, audio = _db.execute(
+            "SELECT COUNT(*), COALESCE(SUM(duration), 0) FROM transcripts"
+        ).fetchone()
+        # Durchsatz ueber alles statt Mittel der Einzelwerte: kurze Memos haben
+        # anteilig mehr Fixkosten und wuerden den Schnitt sonst druecken.
+        audio_sum, proc_sum = _db.execute(
+            """SELECT COALESCE(SUM(duration), 0), COALESCE(SUM(whisper_sec), 0)
+                 FROM transcripts
+                WHERE whisper_sec IS NOT NULL AND whisper_sec > 0"""
+        ).fetchone()
+
+    return {
+        "transcripts": count,
+        "audio_seconds": round(audio, 1),
+        "realtime_factor": round(audio_sum / proc_sum, 1) if proc_sum else None,
+    }
 
 
 # --------------------------------------------------------------------------
@@ -299,9 +347,41 @@ async def health() -> dict[str, Any]:
         "ok": _model is not None,
         "whisper_model": WHISPER_MODEL,
         "device": WHISPER_DEVICE,
+        "compute_type": WHISPER_COMPUTE,
         "summary": _summarizer.health() if _summarizer else {"backend": "?", "ready": False},
         "summary_min_words": SUMMARY_MIN_WORDS,
         "cache_ttl_days": CACHE_TTL_DAYS or None,
+    }
+
+
+@app.get("/stats")
+async def stats() -> dict[str, Any]:
+    """Oeffentliche Kennzahlen fuer das Statusboard.
+
+    Absichtlich ohne Token. Das Statusboard fragt hier direkt ab, statt einen
+    Cron-Sammler dazwischenzuschalten — der koennte still ausfallen und dann
+    Aktualitaet vortaeuschen. Ein erfolgreicher Abruf belegt umgekehrt schon
+    einiges: die Antwort enthaelt Zahlen aus der Datenbank und den Ladezustand
+    beider Modelle.
+
+    Entsprechend steht hier auch nur, was oeffentlich stehen darf: Summen und
+    Mittelwerte, keine Zeitstempel einzelner Nachrichten und nichts aus einem
+    Transkript.
+    """
+    summary = _summarizer.health() if _summarizer else {"backend": "?", "ready": False}
+    return {
+        "service": "whatsapp-transcribe",
+        "ready": _model is not None and bool(summary.get("ready")),
+        "transcription": {
+            "model": WHISPER_MODEL,
+            "device": WHISPER_DEVICE,
+            "compute_type": WHISPER_COMPUTE,
+            "loaded": _model is not None,
+        },
+        # Nur diese drei Felder: die health() des lokalen Backends listet auch
+        # alle vorhandenen Ollama-Modelle auf, das gehoert nicht nach draussen.
+        "summary": {k: summary.get(k) for k in ("backend", "model", "ready")},
+        "totals": cache_stats() if _db is not None else None,
     }
 
 
@@ -358,5 +438,5 @@ async def transcribe(req: TranscribeRequest) -> TranscribeResponse:
         "language": lang,
         "duration_sec": duration,
     }
-    cache_put(sha, payload)
+    cache_put(sha, payload, whisper_sec=whisper_sec)
     return TranscribeResponse(**payload)

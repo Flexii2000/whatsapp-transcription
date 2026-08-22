@@ -53,6 +53,17 @@ git -C "$REPO_DIR" pull --ff-only
 
 cd "$APP_DIR"
 
+# Neue Schalter in .env.example, die in der eigenen .env fehlen. Nicht
+# automatisch eintragen — die Werte sind Entscheidungen, keine Defaults.
+missing=$(comm -23 \
+    <(grep -oE "^[A-Z_]+=" .env.example | sort -u) \
+    <(grep -oE "^[A-Z_]+=" .env         | sort -u) | tr -d "=" | tr "\n" " ")
+if [ -n "${missing// /}" ]; then
+    echo "==> Hinweis: neue Einstellungen in .env.example, die deine .env nicht hat:"
+    echo "    $missing"
+    echo "    (alle haben brauchbare Vorgaben — nur nachtragen, wenn du sie aendern willst)"
+fi
+
 echo "==> docker compose build"
 docker compose build
 
