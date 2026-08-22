@@ -101,11 +101,31 @@ $("test").addEventListener("click", async () => {
     const res = await chrome.runtime.sendMessage({ type: "wat:health" });
     if (!res || !res.ok) throw new Error((res && res.error) || "Keine Antwort");
     const d = res.data;
+    const s = d.summary || {};
+
+    let summary;
+    switch (s.backend) {
+      case "local":
+        summary = s.ready
+          ? `${s.model} (lokal)`
+          : `${s.model} (lokal) — Modell fehlt, es gibt nur Transkripte`;
+        break;
+      case "claude":
+        summary = `${s.model} (Anthropic)`;
+        break;
+      case "none":
+        summary = "aus — nur Transkripte";
+        break;
+      default:
+        summary = "unbekannt";
+    }
+
+    const gerät = d.device === "cuda" ? "GPU" : "CPU";
     out.textContent =
       `Verbindung steht.\n` +
-      `Whisper-Modell : ${d.whisper_model} (${d.device})\n` +
-      `Modell geladen : ${d.ok ? "ja" : "noch nicht — Server startet"}\n` +
-      `Claude-Summary : ${d.summary ? d.summary_model : "aus (kein API-Key auf dem Server)"}`;
+      `Transkription   : ${d.whisper_model} auf ${gerät}${d.compute_type ? ` (${d.compute_type})` : ""}\n` +
+      `Modell geladen  : ${d.ok ? "ja" : "noch nicht — Server startet"}\n` +
+      `Zusammenfassung : ${summary}`;
     flash("Backend erreichbar.", "ok");
   } catch (err) {
     out.textContent = String(err.message || err);

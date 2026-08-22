@@ -348,7 +348,13 @@ async def health() -> dict[str, Any]:
         "whisper_model": WHISPER_MODEL,
         "device": WHISPER_DEVICE,
         "compute_type": WHISPER_COMPUTE,
-        "summary": _summarizer.health() if _summarizer else {"backend": "?", "ready": False},
+        # Wie /stats auf die drei Felder beschraenkt: die health() des lokalen
+        # Backends listet auch alle Ollama-Modelle auf, und /health ist ohne
+        # Token oeffentlich erreichbar.
+        "summary": {
+            k: (_summarizer.health() if _summarizer else {}).get(k)
+            for k in ("backend", "model", "ready")
+        },
         "summary_min_words": SUMMARY_MIN_WORDS,
         "cache_ttl_days": CACHE_TTL_DAYS or None,
     }

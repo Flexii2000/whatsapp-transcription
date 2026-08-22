@@ -26,8 +26,16 @@ from typing import Any, Protocol
 log = logging.getLogger("wat.summary")
 
 MAX_BULLETS = int(os.getenv("SUMMARY_MAX_BULLETS", "5"))
+# Reasoning bei Modellen, die es koennen. Kostet hier ein Vielfaches an Zeit
+# und bringt fuer eine Zusammenfassung wenig — bewusst aus.
+THINK = os.getenv("LLM_THINK", "false").lower() in ("1", "true", "yes")
 
 # Ollama ab 0.5 und die Anthropic-API akzeptieren beide ein JSON-Schema.
+# Die Handlungsaufforderung steht als eigenes Feld, nicht als Textkonvention
+# im Stichpunkt. Kleine Modelle halten sich nicht zuverlaessig an ein "-> "
+# im Prompt — an ein Schemafeld schon, weil der Decoder es erzwingt.
+# Das "-> " haengt der Server danach selbst davor, damit fuer die Extension
+# alles beim Alten bleibt.
 SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -36,9 +44,13 @@ SCHEMA: dict[str, Any] = {
             "items": {"type": "string"},
             "minItems": 1,
             "maxItems": MAX_BULLETS,
-        }
+        },
+        "action": {
+            "type": "string",
+            "description": "Was der Empfaenger tun oder beantworten soll. Leer, wenn nichts.",
+        },
     },
-    "required": ["summary"],
+    "required": ["summary", "action"],
     "additionalProperties": False,
 }
 
@@ -48,7 +60,9 @@ Du fasst transkribierte WhatsApp-Sprachnachrichten fuer den Empfaenger zusammen.
 - Schreibe 1 bis {max_b} knappe Stichpunkte in der Sprache des Transkripts.
 - Der erste Stichpunkt ist die Kernaussage der Nachricht.
 - Konkretes zuerst: Termine, Uhrzeiten, Orte, Zahlen, Namen, Zusagen, Absagen.
-- Was der Empfaenger tun oder beantworten soll, stellst du mit "-> " voran.
+- Uhrzeiten gibst du genau so wieder, wie sie im Transkript stehen.
+- Was der Empfaenger tun oder beantworten soll, gehoert in das Feld "action",
+  nicht in die Stichpunkte. Ist nichts zu tun, bleibt "action" leer.
 - Duze den Empfaenger, so wie die Nachricht selbst es tut. Niemals siezen.
 - Keine Einleitung, keine Meta-Kommentare ("Die Person sagt ..."), keine Floskeln.
 - Offensichtliche Transkriptionsfehler interpretierst du stillschweigend sinnvoll,
@@ -58,11 +72,27 @@ Du fasst transkribierte WhatsApp-Sprachnachrichten fuer den Empfaenger zusammen.
 """
 
 
-def _clean(bullets: Any) -> list[str]:
-    if not isinstance(bullets, list):
+def _clean(payload: Any) -> list[str]:
+    """Aus der Modellantwort die fertige Stichpunktliste bauen."""
+    if not isinstance(payload, dict):
         return []
-    out = [b.strip() for b in bullets if isinstance(b, str) and b.strip()]
-    return out[:MAX_BULLETS]
+
+    bullets = payload.get("summary")
+    out = (
+        [b.strip() for b in bullets if isinstance(b, str) and b.strip()]
+        if isinstance(bullets, list)
+        else []
+    )[:MAX_BULLETS]
+
+    action = payload.get("action")
+    if isinstance(action, str) and action.strip():
+        # Das Praefix erkennt das Content-Script und macht daraus den Pfeil.
+        text = action.strip()
+        if not text.startswith(("->", "\u2192")):
+            text = "-> " + text
+        out.append(text)
+
+    return out
 
 
 class Summarizer(Protocol):
@@ -126,10 +156,19 @@ class LocalSummarizer:
                     # Schema-erzwungenes JSON — erspart das Herumraten an
                     # Freitext-Antworten kleiner Modelle.
                     "format": SCHEMA,
+                    # Reasoning-Modelle (qwen3 & Co.) denken sonst erst
+                    # seitenlang vor sich hin: gemessen 65s statt 3s fuer
+                    # dieselbe Zusammenfassung, und mit einem num_predict-Deckel
+                    # kommt ueberhaupt nichts an — die Tokens gehen komplett
+                    # fuers Denken drauf und `content` bleibt leer.
+                    # Modelle ohne Reasoning ignorieren das Feld.
+                    "think": THINK,
                     "options": {
                         "temperature": 0.2,
                         "num_ctx": 8192,
-                        "num_predict": 400,
+                        # Grosszuegig: eine abgeschnittene Antwort ist kein
+                        # gekuerztes JSON, sondern gar keins.
+                        "num_predict": 1024,
                     },
                     "messages": [
                         {"role": "system", "content": SYSTEM_PROMPT.format(max_b=MAX_BULLETS)},
@@ -151,7 +190,7 @@ class LocalSummarizer:
 
         content = (resp.get("message") or {}).get("content", "")
         try:
-            return _clean(json.loads(content).get("summary"))
+            return _clean(json.loads(content))
         except (json.JSONDecodeError, AttributeError, TypeError) as exc:
             log.warning("Antwort war kein verwertbares JSON (%s): %.200s", exc, content)
             return []
@@ -220,7 +259,7 @@ class ClaudeSummarizer:
 
         try:
             text = next(b.text for b in resp.content if b.type == "text")
-            return _clean(json.loads(text).get("summary"))
+            return _clean(json.loads(text))
         except (StopIteration, json.JSONDecodeError, AttributeError, TypeError) as exc:
             log.warning("Summary-Antwort nicht verwertbar: %s", exc)
             return []
@@ -256,7 +295,7 @@ def build_summarizer() -> Summarizer:
     if backend == "local":
         s = LocalSummarizer(
             base_url=os.getenv("LLM_URL", "http://llm:11434"),
-            model=os.getenv("LLM_MODEL", "qwen3:4b"),
+            model=os.getenv("LLM_MODEL", "gemma3:4b"),
             timeout=int(os.getenv("LLM_TIMEOUT", "120")),
         )
         log.info("Zusammenfassung lokal ueber %s (%s)", s.base_url, s.model)
