@@ -1,5 +1,10 @@
 fastapi==0.118.0
 uvicorn[standard]==0.37.0
 faster-whisper==1.2.0
+# faster-whisper 1.2.0 importiert requests in utils.py, deklariert es aber
+# nicht. Frueher kam es transitiv ueber huggingface_hub mit — seit dessen
+# Umstieg auf httpx (>=1.0) nicht mehr. Ohne diese Zeile stirbt der Container
+# beim Start mit ModuleNotFoundError.
+requests>=2.32
 anthropic>=0.75.0
 pydantic>=2.9,<3

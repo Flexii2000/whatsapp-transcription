@@ -66,15 +66,29 @@ die()  { echo "  ${R}FEHLER${N} $*" >&2; exit 1; }
 port_busy() { ss -ltn 2>/dev/null | grep -q "127.0.0.1:$1 "; }
 mine()      { docker ps --format '{{.Names}}' | grep -qx "$1"; }
 
-# Laesst sich die GPU aus einem Container nutzen? Bewusst mit einem Image,
-# das ohnehin lokal liegt oder winzig ist — der Test darf nichts kosten.
+# Laesst sich die GPU aus einem Container fuer CUDA nutzen?
+#
+# `nvidia-smi -L` allein reicht als Test NICHT: das laeuft auch dann durch,
+# wenn /dev/nvidia-uvm im Container fehlt — und ohne UVM bricht jede echte
+# CUDA-Rechnung mit "CUDA failed with error unknown error" ab.
 gpu_usable() {
     docker info 2>/dev/null | grep -q ' nvidia' || return 1
     command -v nvidia-smi >/dev/null 2>&1 || return 1
+
+# WICHTIG: die Geraeteknoten pruefen, BEVOR irgendetwas nvidia-smi aufruft.
+# nvidia-smi legt /dev/nvidia-uvm im Container selbst an — eine Probe der
+# Form `nvidia-smi && ls /dev/nvidia*` erzeugt sich ihr Ergebnis also selbst
+# und meldet Erfolg, waehrend echtes CUDA danach trotzdem scheitert.
     docker run --rm --runtime=nvidia \
         -e NVIDIA_VISIBLE_DEVICES=all \
         -e NVIDIA_DRIVER_CAPABILITIES=compute,utility \
-        ubuntu:22.04 nvidia-smi -L >/dev/null 2>&1
+        ubuntu:22.04 sh -c 'ls /dev/nvidia-uvm' >/dev/null 2>&1 || return 1
+
+    docker run --rm --runtime=nvidia \
+        -e NVIDIA_VISIBLE_DEVICES=all \
+        -e NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+        ubuntu:22.04 nvidia-smi -L 2>/dev/null | grep -q '^GPU' || return 1
+    return 0
 }
 
 # --------------------------------------------------------------- Vorpruefung
@@ -111,7 +125,7 @@ if gpu_usable; then
 else
     GPU=0
     if command -v nvidia-smi >/dev/null 2>&1; then
-        warn "GPU vorhanden, aber aus Containern nicht nutzbar."
+        warn "GPU vorhanden, aber aus Containern nicht für CUDA nutzbar."
         warn "Einmalig reparieren mit:  sudo ~/scripts/fix-docker-gpu.sh"
         warn "Bis dahin läuft alles auf der CPU (langsamer, funktioniert aber)."
     else
