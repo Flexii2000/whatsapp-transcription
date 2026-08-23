@@ -3,24 +3,42 @@
   "name": "WhatsApp Sprachmemo-Transkription",
   "version": "1.0.0",
   "description": "Transkribiert empfangene WhatsApp-Sprachnachrichten und zeigt Stichpunkte + Volltext direkt in der Nachrichtenblase.",
-  "permissions": ["storage"],
-  "host_permissions": ["https://web.whatsapp.com/*"],
-  "optional_host_permissions": ["https://*/*", "http://*/*"],
+  "permissions": [
+    "storage"
+  ],
+  "host_permissions": [
+    "https://web.whatsapp.com/*",
+    "https://fherrmann.com/*"
+  ],
+  "optional_host_permissions": [
+    "https://*/*",
+    "http://*/*"
+  ],
   "background": {
     "service_worker": "src/background.js",
     "type": "module"
   },
   "content_scripts": [
     {
-      "matches": ["https://web.whatsapp.com/*"],
-      "js": ["src/page-bridge.js"],
+      "matches": [
+        "https://web.whatsapp.com/*"
+      ],
+      "js": [
+        "src/page-bridge.js"
+      ],
       "run_at": "document_start",
       "world": "MAIN"
     },
     {
-      "matches": ["https://web.whatsapp.com/*"],
-      "js": ["src/content.js"],
-      "css": ["src/styles.css"],
+      "matches": [
+        "https://web.whatsapp.com/*"
+      ],
+      "js": [
+        "src/content.js"
+      ],
+      "css": [
+        "src/styles.css"
+      ],
       "run_at": "document_idle",
       "world": "ISOLATED"
     }

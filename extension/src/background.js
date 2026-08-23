@@ -82,8 +82,24 @@ async function backendFetch(path, init, timeoutMs) {
   } catch (err) {
     if (err.name === "AbortError") throw new Error("Zeitüberschreitung — Backend zu langsam?");
     if (err instanceof TypeError) {
+      // Haeufigste Ursache ist die fehlende Host-Berechtigung: ohne sie
+      // behandelt Chrome den Aufruf als normales Cross-Origin-Fetch und der
+      // CORS-Preflight scheitert. Die Konsolenmeldung dazu ("No
+      // Access-Control-Allow-Origin header") sieht nach einem Serverproblem
+      // aus, ist aber keins — deshalb hier zuerst darauf hinweisen.
+      const cfg2 = await settings();
+      let erlaubt = false;
+      try {
+        erlaubt = await chrome.permissions.contains({
+          origins: [new URL(cfg2.backendUrl).origin + "/*"],
+        });
+      } catch {
+        /* ungueltige URL — dann greift die zweite Meldung */
+      }
       throw new Error(
-        "Backend nicht erreichbar. URL korrekt und Zugriff in den Optionen erlaubt?"
+        erlaubt
+          ? "Backend nicht erreichbar — läuft der Dienst und stimmt die URL?"
+          : "Zugriff auf die Backend-Adresse ist nicht erlaubt. In den Optionen auf „Zugriff erlauben“ klicken."
       );
     }
     throw err;

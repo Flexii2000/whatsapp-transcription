@@ -44,15 +44,17 @@ function flash(text, kind = "") {
 /**
  * Aus einer Backend-URL das Muster machen, das chrome.permissions erwartet.
  *
- * Der Pfad kommt bewusst mit hinein: bei einer Backend-URL wie
- * https://fherrmann.com/whisper waere ein Muster auf die blosse Origin eine
- * Berechtigung fuer die gesamte Domain. So bleibt sie auf /whisper/ begrenzt.
+ * Bewusst auf Origin-Ebene, ohne Pfad. Ein pfadgenaues Muster waere zwar
+ * enger, aber Chrome verwaltet Host-Berechtigungen origin-orientiert, und
+ * ein zusaetzlicher Pfad hat hier schon fuer schwer auffindbare
+ * CORS-Preflight-Fehler gesorgt. Sicherheitsgewinn gaebe es ohnehin keinen:
+ * die Extension ruft nur die eine konfigurierte Adresse auf.
  */
 function originPattern(url) {
   try {
     const u = new URL(url);
     if (u.protocol !== "https:" && u.protocol !== "http:") return null;
-    return u.origin + u.pathname.replace(/\/+$/, "") + "/*";
+    return u.origin + "/*";
   } catch {
     return null;
   }
@@ -143,6 +145,19 @@ $("save").addEventListener("click", async () => {
     return flash("Backend-URL ist ungültig.", "err");
   }
   await chrome.storage.local.set({ settings: cfg });
+
+  // Fehlt die Host-Berechtigung, scheitert spaeter jeder Aufruf am
+  // CORS-Preflight — mit einer Meldung, die nicht danach aussieht. Deshalb
+  // hier gleich nachfragen, solange die Nutzeraktion noch zaehlt.
+  const pattern = originPattern(cfg.backendUrl);
+  if (pattern && !(await chrome.permissions.contains({ origins: [pattern] }))) {
+    try {
+      await chrome.permissions.request({ origins: [pattern] });
+    } catch {
+      /* Nutzer kann jederzeit "Zugriff erlauben" druecken */
+    }
+  }
+
   flash("Gespeichert.", "ok");
   refreshPermissionHint();
 });
