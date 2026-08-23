@@ -237,6 +237,24 @@
     }
   }
 
+  /**
+   * Liegt die Zeitstempel-Zeile ausserhalb des normalen Flusses?
+   *
+   * WhatsApp positioniert sie absolut unten rechts in der Blase. Sie
+   * beansprucht dann keine Hoehe, und die letzte Zeile eines langen
+   * Transkripts laeuft darunter durch — sichtbar als Uhrzeit ueber Text,
+   * sobald man den Volltext ausklappt.
+   */
+  function metaUeberlagert(meta) {
+    if (!meta) return false;
+    try {
+      const s = getComputedStyle(meta);
+      return s.position === "absolute" || s.position === "fixed" || s.float !== "none";
+    } catch {
+      return false;
+    }
+  }
+
   function mount(entry) {
     if (!entry.bubble || !entry.bubble.isConnected) return;
     const { parent, meta } = findMount(entry.bubble);
@@ -247,6 +265,9 @@
       else parent.appendChild(entry.nodes.root);
       render(entry);
     }
+    // Nur freihalten, wenn noetig — sonst entstuende bei einer normal
+    // fliessenden Meta-Zeile eine unnoetige Luecke.
+    entry.nodes.root.classList.toggle("wat--reserve", metaUeberlagert(meta));
   }
 
   // ------------------------------------------------------------- Pipeline

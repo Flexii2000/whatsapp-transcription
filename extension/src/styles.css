@@ -193,6 +193,16 @@ body.dark .wat {
   opacity: 0.75;
 }
 
+/*
+ * WhatsApp legt die Zeitstempel-Zeile absolut unten rechts in die Blase.
+ * Aus dem Fluss genommen beansprucht sie keine Hoehe, und ein ausgeklappter
+ * Volltext laeuft mit seiner letzten Zeile darunter durch. Diese Klasse
+ * setzt content.js nur dann, wenn genau das der Fall ist.
+ */
+.wat--reserve {
+  padding-bottom: 1.35em;
+}
+
 .wat[data-wat-state="error"] .wat__label,
 .wat[data-wat-state="idle"] .wat__label {
   text-transform: none;
