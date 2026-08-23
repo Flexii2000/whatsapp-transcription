@@ -60,55 +60,135 @@
     );
   }
 
-  /** Bekannte Ablageorte des entschluesselten Blobs, in Reihenfolge der Wahrscheinlichkeit. */
+  /**
+   * Sucht den entschluesselten Blob in mediaData.
+   *
+   * Bewusst als begrenzte Tiefensuche statt fester Feldnamen: welches Feld
+   * WhatsApp benutzt, hat sich schon mehrfach geaendert. Gemeldet wird der
+   * gefundene Pfad, damit im Debug-Log steht, wo er diesmal lag.
+   */
   function mediaBlobOf(msg) {
-    const md = msg.mediaData || {};
-    const kandidaten = [
-      ["mediaData.mediaBlob._blob", md.mediaBlob && md.mediaBlob._blob],
-      ["mediaData.mediaBlob", md.mediaBlob],
-      ["mediaData._blob", md._blob],
-      ["mediaData.blob", md.blob],
-      ["msg.mediaBlob", msg.mediaBlob],
+    const wurzeln = [
+      ["mediaData", msg.mediaData],
+      ["msg", msg],
     ];
-    for (const [weg, wert] of kandidaten) {
-      if (wert instanceof Blob) return { blob: wert, weg };
-      // Manche Builds verpacken den Blob noch eine Ebene tiefer.
-      if (wert && wert._blob instanceof Blob) return { blob: wert._blob, weg: weg + "._blob" };
+    for (const [name, wurzel] of wurzeln) {
+      const treffer = sucheBlob(wurzel, name, 2, new Set());
+      if (treffer) return treffer;
     }
     return null;
   }
 
-  async function ladeAudio(msg) {
-    let treffer = mediaBlobOf(msg);
-    if (treffer) return { ...treffer, weg: "bereits geladen (" + treffer.weg + ")" };
+  function sucheBlob(obj, pfad, tiefe, gesehen) {
+    if (!obj || typeof obj !== "object" || tiefe < 0 || gesehen.has(obj)) return null;
+    gesehen.add(obj);
+    if (obj instanceof Blob) return { blob: obj, weg: pfad };
 
-    if (typeof msg.downloadMedia === "function") {
-      await msg.downloadMedia({ downloadEvenIfExpensive: true, isUserInitiated: false });
-      treffer = mediaBlobOf(msg);
-      if (treffer) return { ...treffer, weg: "downloadMedia -> " + treffer.weg };
+    for (const key of Object.keys(obj)) {
+      // Interne Model-Felder und Funktionen ueberspringen — dort liegt nie ein Blob.
+      if (key.startsWith("__") || key === "_collections" || key === "_definition") continue;
+      let wert;
+      try {
+        wert = obj[key];
+      } catch {
+        continue;
+      }
+      if (wert instanceof Blob) return { blob: wert, weg: pfad + "." + key };
+      if (wert && typeof wert === "object") {
+        const t = sucheBlob(wert, pfad + "." + key, tiefe - 1, gesehen);
+        if (t) return t;
+      }
     }
+    return null;
+  }
 
-    // Letzter Weg: der DownloadManager direkt. Er stolpert in manchen Builds
-    // ueber fehlenden Logging-Kontext, deshalb erst als Rueckfallebene.
+  const schlaf = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  /** Der Download laeuft asynchron ins Modell — danach erscheint der Blob erst. */
+  async function warteAufBlob(msg, timeoutMs) {
+    const bis = Date.now() + timeoutMs;
+    while (Date.now() < bis) {
+      const t = mediaBlobOf(msg);
+      if (t) return t;
+      await schlaf(200);
+    }
+    return null;
+  }
+
+  /**
+   * Attrappe fuer Metas Performance-Logger. downloadAndMaybeDecrypt ruft
+   * darauf addAnnotations() auf; ohne ein solches Objekt stirbt der Aufruf mit
+   * "Cannot read properties of undefined (reading 'addAnnotations')".
+   * Ein Proxy fangt auch weitere Logger-Methoden ab, die spaeter dazukommen.
+   */
+  function qplAttrappe() {
+    return new Proxy({}, { get: () => () => undefined });
+  }
+
+  function kurz(err) {
+    return String((err && err.message) || err).slice(0, 120);
+  }
+
+  async function ladeAudio(msg) {
+    const schon = mediaBlobOf(msg);
+    if (schon) return { ...schon, weg: "bereits geladen (" + schon.weg + ")" };
+
     const { dm } = wa();
+    const wege = [];
+
+    // Eigens dafuer gebaute Methode am Modell — erster Versuch.
+    if (typeof msg.forceDownloadMediaEvenIfExpensive === "function") {
+      wege.push(["forceDownloadMediaEvenIfExpensive",
+                 () => msg.forceDownloadMediaEvenIfExpensive()]);
+    }
+    // Vollstaendiger Optionssatz: mit nur zwei der sechs Felder blieb der
+    // Logger-Kontext undefiniert.
+    if (typeof msg.downloadMedia === "function") {
+      wege.push(["downloadMedia", () => msg.downloadMedia({
+        downloadEvenIfExpensive: true,
+        isAutoDownload: false,
+        isUserInitiated: true,
+        rmrReason: 1,
+        shouldSequenceDownload: false,
+        shouldThrowAbortError: true,
+      })]);
+    }
+    // Rueckfallebene: der DownloadManager direkt, mit Logger-Attrappe.
     if (dm && typeof dm.downloadAndMaybeDecrypt === "function") {
-      const res = await dm.downloadAndMaybeDecrypt({
+      wege.push(["downloadAndMaybeDecrypt", () => dm.downloadAndMaybeDecrypt({
         directPath: msg.directPath,
         encFilehash: msg.encFilehash,
         filehash: msg.filehash,
         mediaKey: msg.mediaKey,
         mediaKeyTimestamp: msg.mediaKeyTimestamp,
         type: msg.type,
+        mimetype: msg.mimetype,
         signal: new AbortController().signal,
-      });
-      if (res instanceof Blob) return { blob: res, weg: "downloadAndMaybeDecrypt" };
-      if (res instanceof ArrayBuffer) {
-        return { blob: new Blob([res], { type: msg.mimetype || "audio/ogg" }),
-                 weg: "downloadAndMaybeDecrypt (ArrayBuffer)" };
+        downloadOrigin: 1,
+        downloadQpl: qplAttrappe(),
+        partialVideoOpts: null,
+      })]);
+    }
+
+    const fehler = [];
+    for (const [name, fn] of wege) {
+      try {
+        const res = await fn();
+        if (res instanceof Blob) return { blob: res, weg: name };
+        if (res instanceof ArrayBuffer) {
+          return { blob: new Blob([res], { type: msg.mimetype || "audio/ogg" }),
+                   weg: name + " (ArrayBuffer)" };
+        }
+        const t = await warteAufBlob(msg, 20000);
+        if (t) return { blob: t.blob, weg: name + " -> " + t.weg };
+        fehler.push(name + ": kein Blob nach 20s (mediaStage=" +
+                    (msg.mediaData && msg.mediaData.mediaStage) + ")");
+      } catch (err) {
+        fehler.push(name + ": " + kurz(err));
       }
     }
 
-    throw new Error("Audiodaten nicht auffindbar — WhatsApp hat vermutlich umgebaut");
+    throw new Error("Kein Weg lieferte Audiodaten — " + fehler.join(" | "));
   }
 
   function bytesToBase64(bytes) {
